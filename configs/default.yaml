@@ -1,0 +1,39 @@
+# Конфигурация экспериментов Fashion Object Detection.
+# Значения помечены как предварительные и уточняются по результатам EDA и экспериментов.
+
+# --- Пути ---
+paths:
+  raw_data: data/raw           # исходные данные (загруженный датасет)
+  processed_data: data/processed  # обработанные данные
+  results: results             # графики и логи
+  plots: results/plots
+  logs: results/logs
+
+# --- Датасет ---
+dataset:
+  name: detection-datasets/fashionpedia  # имя датасета на Hugging Face
+  # Список используемых классов. Итоговый набор (10-13 категорий) определяется
+  # по результатам разведочного анализа данных (EDA) и фиксируется здесь.
+  categories: null             # null = использовать все 46 категорий (предварительно)
+  splits:
+    test_size: 0.1             # доля train, выделяемая под test (val берётся официальный)
+  subset_size: null            # null = полный датасет; число = подвыборка (для отладки/диска)
+  streaming: false             # потоковая загрузка без полного скачивания на диск
+
+# --- Обучение ---
+training:
+  batch_size: 16               # предварительно
+  learning_rate: 0.001         # предварительно
+  epochs: 50                   # предварительно
+  optimizer: adam              # adam | sgd
+  seed: 42                     # фиксация для воспроизводимости
+  image_size: 640              # размер входного изображения (предварительно)
+  confidence_threshold: 0.25   # порог достоверности предсказаний
+  iou_threshold: 0.5           # порог IoU для NMS
+
+# --- Аугментация ---
+augmentation:
+  horizontal_flip: 0.5         # вероятность горизонтального отражения
+  color_jitter: 0.2            # интенсивность цветовых искажений
+  random_crop: false           # случайное кадрирование
+  mosaic: 0.0                  # mosaic-аугментация (актуальна для YOLO)

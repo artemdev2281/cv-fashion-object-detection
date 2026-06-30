@@ -1,0 +1,26 @@
+# Глубокое обучение
+torch>=2.1.0
+torchvision>=0.16.0
+
+# YOLOv8
+ultralytics>=8.1.0
+
+# Загрузка датасета Fashionpedia
+datasets>=2.16.0
+
+# Обработка данных
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Визуализация
+matplotlib>=3.7.0
+pillow>=10.0.0
+
+# Конфигурация
+pyyaml>=6.0
+
+# Метрики в формате COCO
+pycocotools>=2.0.7
+
+# Прогресс-бары
+tqdm>=4.66.0

@@ -1,0 +1,39 @@
+# --- Данные (содержимое не хранится в git, папки сохраняются через .gitkeep) ---
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# --- Результаты обучения ---
+results/logs/*
+!results/logs/.gitkeep
+
+# --- Веса моделей ---
+*.pt
+*.pth
+*.onnx
+
+# --- Кеш Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Кеш Hugging Face datasets ---
+.cache/
+huggingface/
+datasets/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Виртуальные окружения ---
+venv/
+.venv/
+env/
+
+# --- Служебное ---
+.env
+.DS_Store
