@@ -26,6 +26,58 @@ HF_DATASET_NAME = "detection-datasets/fashionpedia"
 #: Каталог для размещения исходных данных (data/raw в корне проекта).
 DEFAULT_RAW_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
 
+#: Канонический список 46 категорий Fashionpedia (порядок соответствует
+#: числовым идентификаторам). Используется как запасной вариант, если у поля
+#: ``category`` в датасете отсутствуют встроенные имена классов (ClassLabel).
+FASHIONPEDIA_CATEGORIES = [
+    "shirt, blouse",
+    "top, t-shirt, sweatshirt",
+    "sweater",
+    "cardigan",
+    "jacket",
+    "vest",
+    "pants",
+    "shorts",
+    "skirt",
+    "coat",
+    "dress",
+    "jumpsuit",
+    "cape",
+    "glasses",
+    "hat",
+    "headband, head covering, hair accessory",
+    "tie",
+    "glove",
+    "watch",
+    "belt",
+    "leg warmer",
+    "tights, stockings",
+    "sock",
+    "shoe",
+    "bag, wallet",
+    "scarf",
+    "umbrella",
+    "hood",
+    "collar",
+    "lapel",
+    "epaulette",
+    "sleeve",
+    "pocket",
+    "neckline",
+    "buckle",
+    "zipper",
+    "applique",
+    "bead",
+    "bow",
+    "flower",
+    "fringe",
+    "ribbon",
+    "rivet",
+    "ruffle",
+    "sequin",
+    "tassel",
+]
+
 
 def set_seed(seed: int = 42) -> None:
     """Зафиксировать генераторы случайных чисел для воспроизводимости."""
@@ -94,13 +146,22 @@ def get_category_names(dataset) -> list[str]:
 
     Категориям в датасете соответствуют числовые идентификаторы (0–45);
     функция возвращает их строковые наименования в порядке идентификаторов.
+
+    Поле ``objects`` может быть представлено двумя способами: как структура из
+    параллельных списков (``features['objects']['category']``) либо как
+    ``Sequence``-обёртка над структурой (``features['objects'].feature[...]``);
+    функция поддерживает оба варианта. Если у поля ``category`` нет встроенных
+    имён классов, используется :data:`FASHIONPEDIA_CATEGORIES`.
     """
-    category_feature = dataset.features["objects"].feature["category"]
-    names = getattr(category_feature, "names", None)
+    objects_feature = dataset.features["objects"]
+    # Sequence-обёртка над структурой -> разворачиваем до самой структуры.
+    struct = getattr(objects_feature, "feature", objects_feature)
+    category_feature = struct["category"]
+    # category может быть Sequence(ClassLabel) либо ClassLabel напрямую.
+    inner = getattr(category_feature, "feature", category_feature)
+    names = getattr(inner, "names", None) or getattr(category_feature, "names", None)
     if names is None:
-        raise ValueError(
-            "Не удалось определить наименования категорий из признаков датасета."
-        )
+        return list(FASHIONPEDIA_CATEGORIES)
     return list(names)
 
 
