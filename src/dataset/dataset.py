@@ -99,7 +99,7 @@ def load_fashionpedia(
     streaming:
         Потоковая загрузка без полного скачивания на диск. Полезно при
         ограниченном дисковом пространстве; в этом режиме недоступно
-        стратифицированное разбиение (см. :func:`prepare_data`).
+        стратифицированное разбиение (см. :func:`stratified_split`).
     subset_size:
         Если задано, из каждого split берутся первые ``subset_size`` примеров
         (для отладки и работы с ограниченным диском).
@@ -165,126 +165,204 @@ def get_category_names(dataset) -> list[str]:
     return list(names)
 
 
-def _resolve_category_ids(
-    categories: Sequence[str | int],
-    category_names: Sequence[str],
-) -> set[int]:
-    """Преобразовать имена/индексы выбранных категорий в множество id."""
-    name_to_id = {name: idx for idx, name in enumerate(category_names)}
-    resolved: set[int] = set()
-    for category in categories:
-        if isinstance(category, int):
-            resolved.add(category)
-        elif category in name_to_id:
-            resolved.add(name_to_id[category])
-        else:
-            raise KeyError(f"Неизвестная категория: {category!r}")
-    return resolved
+def resolve_selected_categories(
+    dataset,
+    selected_names: Sequence[str],
+) -> tuple[dict[int, int], list[str]]:
+    """Сопоставить выбранные категории (по именам) с id датасета.
+
+    Исходные ``category_id`` восстанавливаются программно из имён категорий
+    датасета (а не принимаются на веру), что защищает от рассинхронизации
+    порядка классов. Новые последовательные id (0..N-1) назначаются согласно
+    порядку имён в ``selected_names``.
+
+    Параметры
+    ---------
+    dataset:
+        Любой split датасета (для чтения имён категорий).
+    selected_names:
+        Упорядоченный список имён отобранных категорий; индекс имени в списке
+        становится новым id класса.
+
+    Возвращает
+    ----------
+    Кортеж ``(orig_to_new, class_names)``, где ``orig_to_new`` отображает
+    исходный id -> новый id, а ``class_names`` — имена в порядке новых id.
+    """
+    all_names = get_category_names(dataset)
+    name_to_orig = {name: idx for idx, name in enumerate(all_names)}
+
+    orig_to_new: dict[int, int] = {}
+    class_names: list[str] = []
+    for new_id, name in enumerate(selected_names):
+        if name not in name_to_orig:
+            raise KeyError(
+                f"Категория {name!r} отсутствует в датасете. "
+                f"Проверьте configs/default.yaml (dataset.categories)."
+            )
+        orig_to_new[name_to_orig[name]] = new_id
+        class_names.append(name)
+    return orig_to_new, class_names
 
 
-def filter_by_categories(dataset, category_ids: set[int]):
-    """Оставить в каждом примере только объекты выбранных категорий.
+def filter_remap_clean(dataset, orig_to_new: dict[int, int]):
+    """Отфильтровать, переиндексировать и очистить аннотации.
 
-    Изображения, на которых после фильтрации не осталось объектов, удаляются.
+    Для каждого изображения:
+
+    * оставляются только объекты отобранных категорий (по исходному id);
+    * исходные id заменяются на новые последовательные id (remap);
+    * очистка аннотаций — координаты рамки обрезаются по границам изображения,
+      вырожденные рамки (нулевая/отрицательная площадь) отбрасываются;
+    * изображения без валидных объектов после обработки исключаются.
+
+    Рамки предполагаются в формате Pascal VOC ``[x_min, y_min, x_max, y_max]``.
     """
 
-    def _filter_objects(example):
+    def _process(example):
+        width, height = example["width"], example["height"]
         objects = example["objects"]
-        keep = [i for i, c in enumerate(objects["category"]) if c in category_ids]
+        bbox_ids, categories, boxes, areas = [], [], [], []
+        for index, orig_category in enumerate(objects["category"]):
+            if orig_category not in orig_to_new:
+                continue
+            x_min, y_min, x_max, y_max = objects["bbox"][index]
+            # Очистка: обрезка по границам изображения.
+            x_min = max(0.0, min(float(x_min), width))
+            y_min = max(0.0, min(float(y_min), height))
+            x_max = max(0.0, min(float(x_max), width))
+            y_max = max(0.0, min(float(y_max), height))
+            # Отбраковка вырожденных рамок.
+            if x_max <= x_min or y_max <= y_min:
+                continue
+            bbox_ids.append(objects["bbox_id"][index])
+            categories.append(orig_to_new[orig_category])
+            boxes.append([x_min, y_min, x_max, y_max])
+            areas.append((x_max - x_min) * (y_max - y_min))
         example["objects"] = {
-            key: [values[i] for i in keep] for key, values in objects.items()
+            "bbox_id": bbox_ids,
+            "category": categories,
+            "bbox": boxes,
+            "area": areas,
         }
         return example
 
-    dataset = dataset.map(_filter_objects)
+    dataset = dataset.map(_process)
     dataset = dataset.filter(lambda ex: len(ex["objects"]["category"]) > 0)
     return dataset
 
 
-def _add_primary_category(dataset, num_categories: int):
-    """Добавить столбец ``primary_category`` — преобладающую категорию изображения.
+def _class_frequencies(dataset, num_classes: int) -> list[int]:
+    """Подсчитать число экземпляров каждого класса (по новым id)."""
+    counts = [0] * num_classes
+    for objects in dataset["objects"]:
+        for category in objects["category"]:
+            counts[category] += 1
+    return counts
 
-    Категория используется как метка для стратифицированного разбиения.
+
+def _add_stratify_label(dataset, num_classes: int):
+    """Добавить столбец ``strat_label`` для стратифицированного разбиения.
+
+    Изображение является мультиметочным (несколько классов одновременно), для
+    которого строгая multilabel-стратификация нетривиальна. В качестве
+    практической аппроксимации в роли метки стратификации используется
+    **самый редкий из присутствующих на изображении классов** (по глобальной
+    частоте в train). Такой выбор лучше сохраняет редкие классы при разбиении,
+    чем метка по преобладающему классу.
     """
     from datasets import ClassLabel
 
-    def _primary(example):
-        cats = example["objects"]["category"]
-        example["primary_category"] = max(set(cats), key=cats.count)
+    frequencies = _class_frequencies(dataset, num_classes)
+
+    def _label(example):
+        present = set(example["objects"]["category"])
+        example["strat_label"] = min(present, key=lambda c: frequencies[c])
         return example
 
-    dataset = dataset.map(_primary)
+    dataset = dataset.map(_label)
     dataset = dataset.cast_column(
-        "primary_category", ClassLabel(num_classes=num_categories)
+        "strat_label", ClassLabel(num_classes=num_classes)
     )
     return dataset
 
 
-def prepare_data(
-    categories: Optional[Sequence[str | int]] = None,
+def stratified_split(train_dataset, test_size: float, seed: int, num_classes: int):
+    """Разбить train на train/test со стратификацией по классам.
+
+    Разбиение выполняется на уровне изображений, поэтому одно изображение не
+    может попасть в оба сплита (защита от утечки данных). ``random seed``
+    фиксируется для воспроизводимости.
+
+    Если стратификация невозможна (например, на подвыборке некоторый класс
+    представлен слишком малым числом примеров), выполняется обычное случайное
+    разбиение с тем же фиксированным seed, о чём выводится предупреждение.
+    """
+    labelled = _add_stratify_label(train_dataset, num_classes)
+    try:
+        split = labelled.train_test_split(
+            test_size=test_size,
+            stratify_by_column="strat_label",
+            seed=seed,
+        )
+    except ValueError:
+        import warnings
+
+        warnings.warn(
+            "Стратифицированное разбиение невозможно (недостаточно примеров "
+            "некоторого класса); выполняется случайное разбиение с фиксированным "
+            "seed. Обычно возникает при работе с подвыборкой (subset_size).",
+            RuntimeWarning,
+        )
+        split = labelled.train_test_split(test_size=test_size, seed=seed)
+    return split.remove_columns("strat_label")
+
+
+def build_splits(
+    selected_names: Sequence[str],
     test_size: float = 0.1,
     subset_size: Optional[int] = None,
-    streaming: bool = False,
     seed: int = 42,
     cache_dir: os.PathLike | str = DEFAULT_RAW_DIR,
 ):
-    """Загрузить и предобработать Fashionpedia.
+    """Собрать финальные сплиты train/val/test с фильтрацией и очисткой.
 
-    Выполняет полный цикл подготовки данных:
-
-    1. загрузка датасета с Hugging Face;
-    2. (опционально) фильтрация по выбранным категориям;
-    3. стратифицированное разбиение train на train/test (val — официальный).
-
-    Параметры
-    ---------
-    categories:
-        Имена или идентификаторы категорий, которые следует оставить.
-        ``None`` — использовать все категории.
-    test_size:
-        Доля обучающей выборки, выделяемая под test.
-    subset_size, streaming, seed, cache_dir:
-        См. :func:`load_fashionpedia`.
+    Порядок операций: загрузка -> сверка и разрешение категорий -> фильтрация,
+    remap и очистка каждого split -> стратифицированное разбиение официального
+    train на train/test (официальный val используется как validation).
 
     Возвращает
     ----------
-    ``DatasetDict`` со split-ами ``train``, ``test``, ``val`` (в потоковом
-    режиме разбиение train не выполняется и возвращаются ``train``/``val``).
+    Кортеж ``(dataset_dict, class_names, orig_to_new)``, где ``dataset_dict`` —
+    ``DatasetDict`` со split-ами ``train``, ``val``, ``test``.
     """
+    from datasets import DatasetDict
+
     set_seed(seed)
     dataset = load_fashionpedia(
-        streaming=streaming,
+        streaming=False,
         subset_size=subset_size,
         cache_dir=cache_dir,
         seed=seed,
     )
 
-    category_names = get_category_names(dataset["train"])
-    num_categories = len(category_names)
-
-    if categories is not None:
-        category_ids = _resolve_category_ids(categories, category_names)
-        dataset = {
-            split: filter_by_categories(ds, category_ids)
-            for split, ds in dataset.items()
-        }
-
-    if streaming:
-        # train_test_split недоступен для потоковых датасетов.
-        return dataset
-
-    from datasets import DatasetDict
-
-    train_with_label = _add_primary_category(dataset["train"], num_categories)
-    split = train_with_label.train_test_split(
-        test_size=test_size,
-        stratify_by_column="primary_category",
-        seed=seed,
+    orig_to_new, class_names = resolve_selected_categories(
+        dataset["train"], selected_names
     )
-    split = split.remove_columns("primary_category")
+    num_classes = len(class_names)
 
-    return DatasetDict(
+    filtered = {
+        split: filter_remap_clean(ds, orig_to_new)
+        for split, ds in dataset.items()
+    }
+
+    split = stratified_split(
+        filtered["train"], test_size=test_size, seed=seed, num_classes=num_classes
+    )
+
+    dataset_dict = DatasetDict(
         train=split["train"],
+        val=filtered["val"],
         test=split["test"],
-        val=dataset["val"],
     )
+    return dataset_dict, class_names, orig_to_new

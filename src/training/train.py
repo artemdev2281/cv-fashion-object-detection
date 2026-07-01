@@ -18,7 +18,7 @@ def train(model, dataset, config: dict):
     model:
         Модель, созданная фабрикой ``build_model`` соответствующего модуля.
     dataset:
-        Подготовленный датасет (см. :func:`src.dataset.dataset.prepare_data`).
+        Подготовленный датасет (см. :func:`src.dataset.prepare.prepare_dataset`).
     config:
         Параметры обучения (см. ``configs/default.yaml``).
     """
