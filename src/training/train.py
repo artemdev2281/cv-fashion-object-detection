@@ -30,9 +30,12 @@ Ultralytics читает изображения и разметку сам по 
 
 from __future__ import annotations
 
+import csv
 import json
+import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, Sequence
 
 from src.dataset.transforms import yolo_augmentation_args
 from src.utils.utils import PROJECT_ROOT, get_logger
@@ -240,6 +243,252 @@ def _free_cuda() -> None:
             torch.cuda.empty_cache()
     except Exception:  # pragma: no cover - вспомогательная очистка
         pass
+
+
+# ---------------------------------------------------------------------------
+# torchvision-детекторы (Faster R-CNN, SSD) — общий цикл обучения и оценки.
+# ---------------------------------------------------------------------------
+
+#: Целевое число эпох (совпадает с YOLOv8-baseline для честного сравнения).
+TORCHVISION_EPOCHS = 20
+
+#: Минимальный batch, ниже которого при OOM опускаться не имеет смысла.
+_MIN_BATCH = 1
+
+
+def _seed_torch(seed: int) -> None:
+    """Зафиксировать генераторы (torch/numpy/random) для воспроизводимости."""
+    import random
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _batch_schedule(start: int) -> list[int]:
+    """Последовательность batch для отката при OOM: start, /2, ... , 1."""
+    schedule, value = [], int(start)
+    while value >= _MIN_BATCH:
+        schedule.append(value)
+        if value == _MIN_BATCH:
+            break
+        value = max(_MIN_BATCH, value // 2)
+    return schedule
+
+
+def train_torchvision_detector(
+    model,
+    train_loader,
+    eval_loader,
+    config: dict,
+    *,
+    model_name: str,
+    class_names: Sequence[str],
+    epochs: int = TORCHVISION_EPOCHS,
+    device: Optional[str] = None,
+    lr: float = 0.005,
+    momentum: float = 0.9,
+    weight_decay: float = 0.0005,
+    project: str | Path | None = None,
+    label_offset: int = 1,
+    logger=None,
+) -> dict:
+    """Общий цикл обучения torchvision detection моделей (Faster R-CNN и SSD).
+
+    Одна функция на обе модели (без дублирования). Обучает на ``train_loader``,
+    затем оценивает на ``eval_loader`` (передавать **test**-сплит для итоговой
+    честной оценки, как у YOLOv8) через :func:`evaluate_coco_detector`.
+
+    Оптимизатор — **SGD** (lr≈0.005, momentum 0.9, weight_decay 5e-4). Для
+    архитектур Faster R-CNN / SSD это общепринятая практика, дающая устойчивую
+    сходимость; ``optimizer: adam`` из ``configs/default.yaml`` относится к
+    YOLOv8-baseline и намеренно НЕ используется здесь (в §3.5 у каждой модели
+    своя строка гиперпараметров). ``epochs`` и ``seed`` — как у baseline.
+
+    Логирует loss по эпохам (консоль + ``results.csv``, аналогично YOLOv8),
+    сохраняет веса ``<model_name>.pth`` и ``metrics.json`` в
+    ``results/logs/<model_name>/``.
+    """
+    import torch
+
+    logger = logger or get_logger()
+    training_cfg = config.get("training", {})
+    seed = training_cfg.get("seed", 42)
+    _seed_torch(seed)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if project is None:
+        project = PROJECT_ROOT / "results" / "logs"
+    out_dir = Path(project) / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.to(device)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        params, lr=lr, momentum=momentum, weight_decay=weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=max(1, int(epochs * 0.7)), gamma=0.1
+    )
+
+    csv_path = out_dir / "results.csv"
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_writer = None
+
+    logger.info(
+        "%s: старт обучения — epochs=%d, device=%s, optimizer=SGD(lr=%.4g, "
+        "momentum=%.2g, wd=%.4g)",
+        model_name, epochs, device, lr, momentum, weight_decay,
+    )
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        start_time = time.time()
+        running_loss = 0.0
+        components: dict[str, float] = defaultdict(float)
+        num_batches = 0
+
+        for images, targets in train_loader:
+            images = [image.to(device) for image in images]
+            targets = [
+                {key: value.to(device) for key, value in target.items()}
+                for target in targets
+            ]
+            loss_dict = model(images, targets)
+            loss = sum(loss_dict.values())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += float(loss.item())
+            for key, value in loss_dict.items():
+                components[key] += float(value.item())
+            num_batches += 1
+
+        scheduler.step()
+        avg_loss = running_loss / max(1, num_batches)
+        avg_components = {k: v / max(1, num_batches) for k, v in components.items()}
+        elapsed = time.time() - start_time
+
+        row = {
+            "epoch": epoch,
+            "train_loss": round(avg_loss, 6),
+            **{k: round(v, 6) for k, v in avg_components.items()},
+            "lr": optimizer.param_groups[0]["lr"],
+            "time_s": round(elapsed, 1),
+        }
+        if csv_writer is None:
+            csv_writer = csv.DictWriter(csv_file, fieldnames=list(row.keys()))
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
+        csv_file.flush()
+
+        logger.info(
+            "%s | эпоха %2d/%d | loss=%.4f | lr=%.2g | %.0f c",
+            model_name, epoch, epochs, avg_loss,
+            optimizer.param_groups[0]["lr"], elapsed,
+        )
+
+    csv_file.close()
+
+    weights_path = out_dir / f"{model_name}.pth"
+    torch.save(model.state_dict(), weights_path)
+    logger.info("%s: веса сохранены -> %s", model_name, weights_path)
+
+    logger.info("%s: оценка на test через COCOeval...", model_name)
+    from src.evaluation.metrics import evaluate_coco_detector
+
+    metrics = evaluate_coco_detector(
+        model, eval_loader, device, class_names,
+        label_offset=label_offset, logger=logger,
+    )
+    metrics.update(
+        {"save_dir": str(out_dir), "weights": str(weights_path),
+         "epochs": epochs, "model": model_name}
+    )
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, ensure_ascii=False, indent=2)
+    logger.info("%s: метрики сохранены -> %s", model_name, out_dir / "metrics.json")
+    return metrics
+
+
+def run_torchvision_training(
+    model_builder: Callable[[int], object],
+    num_classes: int,
+    train_ann: str | Path,
+    eval_ann: str | Path,
+    data_root: str | Path,
+    config: dict,
+    *,
+    model_name: str,
+    class_names: Sequence[str],
+    batch_size: int = 4,
+    epochs: int = TORCHVISION_EPOCHS,
+    label_offset: int = 1,
+    num_workers: int = 2,
+    subset_size: Optional[int] = None,
+    project: str | Path | None = None,
+    logger=None,
+    **train_kwargs,
+) -> dict:
+    """Собрать loaders, модель и обучить с авто-откатом batch при OOM.
+
+    Faster R-CNN / SSD с ResNet/VGG backbone тяжелее YOLOv8 по памяти, на
+    Tesla T4 (14 ГБ) обычно нужен batch 4–8. При ``CUDA out of memory`` batch
+    последовательно уменьшается (``batch, /2, ... , 1``), модель и loaders
+    пересобираются заново.
+
+    ``model_builder(num_classes)`` — фабрика модели
+    (``src.models.faster_rcnn.build_model`` / ``src.models.ssd.build_model``).
+    ``eval_ann`` — аннотации сплита для итоговой оценки (передавать test).
+    """
+    from src.dataset.coco_dataset import build_loader
+
+    logger = logger or get_logger()
+
+    last_error: Optional[Exception] = None
+    for attempt_batch in _batch_schedule(batch_size):
+        try:
+            train_loader = build_loader(
+                train_ann, data_root, batch_size=attempt_batch, shuffle=True,
+                num_workers=num_workers, label_offset=label_offset,
+                subset_size=subset_size,
+            )
+            eval_loader = build_loader(
+                eval_ann, data_root, batch_size=1, shuffle=False,
+                num_workers=num_workers, label_offset=label_offset,
+                subset_size=subset_size,
+            )
+            model = model_builder(num_classes)
+            logger.info("%s: попытка обучения с batch=%d", model_name, attempt_batch)
+            return train_torchvision_detector(
+                model, train_loader, eval_loader, config,
+                model_name=model_name, class_names=class_names, epochs=epochs,
+                label_offset=label_offset, project=project, logger=logger,
+                **train_kwargs,
+            )
+        except RuntimeError as error:
+            last_error = error
+            if "out of memory" in str(error).lower() and attempt_batch > _MIN_BATCH:
+                logger.warning(
+                    "%s: OOM при batch=%d — уменьшаю batch и пробую снова. %s",
+                    model_name, attempt_batch, error,
+                )
+                _free_cuda()
+                continue
+            raise
+
+    raise RuntimeError(
+        f"{model_name}: не удалось обучить даже при batch={_MIN_BATCH}. "
+        f"Исходная ошибка: {last_error}"
+    )
 
 
 def _count_split_images(data_yaml: str | Path, split: str) -> int:

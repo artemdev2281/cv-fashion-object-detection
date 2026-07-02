@@ -1,24 +1,44 @@
 """Модель Faster R-CNN (двухэтапный детектор с сетью предложения областей).
 
-Модуль инкапсулирует создание, обучение и инференс модели Faster R-CNN
-(сеть-основа ResNet) в едином интерфейсе, согласованном с остальными
-детекторами проекта. Содержательная реализация добавляется на этапе обучения
-моделей (разделы 3.5–3.6 отчёта).
+Fine-tuning предобученной на COCO ``fasterrcnn_resnet50_fpn`` из
+``torchvision.models.detection``: заменяется финальный классификатор
+(``box_predictor``) под число классов проекта. Модель — обычный
+``torch.nn.Module`` с собственным протоколом detection (в режиме ``train`` при
+переданных таргетах возвращает словарь лоссов, в ``eval`` — предсказания),
+поэтому обучается общим циклом
+:func:`src.training.train.train_torchvision_detector`.
 """
 
 from __future__ import annotations
 
 
 def build_model(num_classes: int, config: dict | None = None):
-    """Создать модель Faster R-CNN для заданного числа классов.
+    """Создать Faster R-CNN (ResNet50-FPN) под ``num_classes``.
 
     Параметры
     ---------
     num_classes:
-        Число категорий одежды (учитывая фоновый класс при необходимости).
+        **Полное** число классов, включая фон: 11 категорий одежды + 1 фон = 12.
+        В torchvision detection класс 0 зарезервирован под фон; метки объектов
+        поэтому подаются сдвинутыми на +1 (см. :mod:`src.dataset.coco_dataset`).
     config:
-        Параметры модели и обучения (см. ``configs/default.yaml``).
+        Конфигурация эксперимента (для совместимости интерфейса; гиперпараметры
+        обучения передаются в цикл обучения, а не в конструктор).
+
+    Возвращает
+    ----------
+    ``torchvision.models.detection.FasterRCNN`` с новым ``box_predictor``.
     """
-    raise NotImplementedError(
-        "Реализация Faster R-CNN будет добавлена на этапе обучения."
-    )
+    try:
+        import torchvision
+        from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+    except ImportError as error:  # pragma: no cover - зависит от среды
+        raise ImportError(
+            "Для Faster R-CNN требуется torchvision. "
+            "Установите зависимости: pip install -r requirements.txt"
+        ) from error
+
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    return model
