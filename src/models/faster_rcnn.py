@@ -38,7 +38,15 @@ def build_model(num_classes: int, config: dict | None = None):
             "Установите зависимости: pip install -r requirements.txt"
         ) from error
 
-    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
+    # Разрешение входа берём из конфига (training.image_size). Понижение с
+    # дефолтных 800/1333 ускоряет обучение на Tesla T4 в разы; согласуем с
+    # image_size YOLOv8 (640) для сопоставимости масштаба.
+    image_size = (config or {}).get("training", {}).get("image_size", 800)
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(
+        weights="DEFAULT",
+        min_size=int(image_size),
+        max_size=int(image_size * 1.66),
+    )
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     return model

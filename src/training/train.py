@@ -337,6 +337,11 @@ def train_torchvision_detector(
         optimizer, step_size=max(1, int(epochs * 0.7)), gamma=0.1
     )
 
+    # Mixed precision (AMP) — заметно ускоряет обучение тяжёлых torchvision
+    # детекторов на GPU (Tesla T4) и снижает расход памяти.
+    use_amp = str(device).startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     csv_path = out_dir / "results.csv"
     csv_file = open(csv_path, "w", newline="", encoding="utf-8")
     csv_writer = None
@@ -360,12 +365,13 @@ def train_torchvision_detector(
                 {key: value.to(device) for key, value in target.items()}
                 for target in targets
             ]
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values())
-
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                loss_dict = model(images, targets)
+                loss = sum(loss_dict.values())
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += float(loss.item())
             for key, value in loss_dict.items():
@@ -420,7 +426,7 @@ def train_torchvision_detector(
 
 
 def run_torchvision_training(
-    model_builder: Callable[[int], object],
+    model_builder: Callable[..., object],
     num_classes: int,
     train_ann: str | Path,
     eval_ann: str | Path,
@@ -434,6 +440,7 @@ def run_torchvision_training(
     label_offset: int = 1,
     num_workers: int = 2,
     subset_size: Optional[int] = None,
+    eval_subset_size: Optional[int] = None,
     project: str | Path | None = None,
     logger=None,
     **train_kwargs,
@@ -445,9 +452,13 @@ def run_torchvision_training(
     последовательно уменьшается (``batch, /2, ... , 1``), модель и loaders
     пересобираются заново.
 
-    ``model_builder(num_classes)`` — фабрика модели
+    ``model_builder(num_classes, config)`` — фабрика модели
     (``src.models.faster_rcnn.build_model`` / ``src.models.ssd.build_model``).
     ``eval_ann`` — аннотации сплита для итоговой оценки (передавать test).
+    ``subset_size`` ограничивает **train** (например, из-за GPU-квоты Kaggle),
+    ``eval_subset_size`` — **eval** (по умолчанию ``None`` = полный test, что
+    сохраняет сопоставимость итоговых метрик со всеми моделями). Для smoke-теста
+    задают оба.
     """
     from src.dataset.coco_dataset import build_loader
 
@@ -464,9 +475,9 @@ def run_torchvision_training(
             eval_loader = build_loader(
                 eval_ann, data_root, batch_size=1, shuffle=False,
                 num_workers=num_workers, label_offset=label_offset,
-                subset_size=subset_size,
+                subset_size=eval_subset_size,
             )
-            model = model_builder(num_classes)
+            model = model_builder(num_classes, config)
             logger.info("%s: попытка обучения с batch=%d", model_name, attempt_batch)
             return train_torchvision_detector(
                 model, train_loader, eval_loader, config,
