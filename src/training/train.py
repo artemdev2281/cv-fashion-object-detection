@@ -256,6 +256,24 @@ TORCHVISION_EPOCHS = 20
 _MIN_BATCH = 1
 
 
+def _build_optimizer(params, name: str, *, lr: float, momentum: float, weight_decay: float):
+    """Создать оптимизатор по имени (для HP-экспериментов: sgd/adam/adamw).
+
+    У Adam/AdamW рабочий lr обычно на порядок меньше, чем у SGD.
+    Подходящее значение lr должен передать вызывающий код.
+    """
+    import torch
+
+    key = str(name).lower()
+    if key == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    if key == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if key == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    raise ValueError(f"Неизвестный оптимизатор: {name!r} (ожидается sgd/adam/adamw).")
+
+
 def _seed_torch(seed: int) -> None:
     """Зафиксировать генераторы (torch/numpy/random) для воспроизводимости."""
     import random
@@ -291,6 +309,7 @@ def train_torchvision_detector(
     class_names: Sequence[str],
     epochs: int = TORCHVISION_EPOCHS,
     device: Optional[str] = None,
+    optimizer_name: str = "sgd",
     lr: float = 0.005,
     momentum: float = 0.9,
     weight_decay: float = 0.0005,
@@ -330,8 +349,8 @@ def train_torchvision_detector(
 
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(
-        params, lr=lr, momentum=momentum, weight_decay=weight_decay
+    optimizer = _build_optimizer(
+        params, optimizer_name, lr=lr, momentum=momentum, weight_decay=weight_decay
     )
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=max(1, int(epochs * 0.7)), gamma=0.1
@@ -347,9 +366,8 @@ def train_torchvision_detector(
     csv_writer = None
 
     logger.info(
-        "%s: старт обучения — epochs=%d, device=%s, optimizer=SGD(lr=%.4g, "
-        "momentum=%.2g, wd=%.4g)",
-        model_name, epochs, device, lr, momentum, weight_decay,
+        "%s: старт обучения — epochs=%d, device=%s, optimizer=%s(lr=%.4g, wd=%.4g)",
+        model_name, epochs, device, optimizer_name.upper(), lr, weight_decay,
     )
 
     for epoch in range(1, epochs + 1):
