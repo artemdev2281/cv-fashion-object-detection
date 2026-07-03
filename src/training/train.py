@@ -536,13 +536,25 @@ def train_efficientdet_detector(
     device: Optional[str] = None,
     image_size: int = 512,
     optimizer_name: str = "sgd",
-    lr: float = 0.01,
+    lr: float = 0.002,
     momentum: float = 0.9,
     weight_decay: float = 0.0004,
+    warmup_steps: int = 300,
     project: str | Path | None = None,
     logger=None,
 ) -> dict:
-    """Обучить EfficientDet (``effdet.DetBenchTrain``) и вернуть метрики на test."""
+    """Обучить EfficientDet (``effdet.DetBenchTrain``) и вернуть метрики на test.
+
+    ``lr=0.002`` (не 0.01) и ``warmup_steps=300`` — по результатам реального
+    smoke-теста на Fashionpedia: с ``lr=0.01`` без warmup модель за 1-2 эпохи
+    "проваливалась" в тривиальное решение (loss быстро сходился к низкому
+    плато, но mAP оставался ~0 даже после 10 эпох на 300 изображениях) — типичный
+    симптом того, что первые же шаги SGD с высоким lr портят предобученные веса
+    backbone/BiFPN, прежде чем классификационная голова успевает чему-то
+    научиться. Линейный warmup первых ``warmup_steps`` шагов (от ~0 до ``lr``)
+    — стандартная практика при дообучении anchor-based детекторов (RetinaNet/
+    EfficientDet) и должен устранить этот коллапс.
+    """
 
     import torch as _torch
 
@@ -570,6 +582,9 @@ def train_efficientdet_detector(
     scheduler = _torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=max(1, int(epochs * 0.7)), gamma=0.1
     )
+    # Не даём warmup растянуться на несколько эпох (иначе scheduler.step() на
+    # границе эпохи будет "пилить" lr обратно вниз, пока warmup не завершится).
+    warmup_steps = min(warmup_steps, len(train_loader))
 
     use_amp = str(device).startswith("cuda")
     scaler = _torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -579,10 +594,11 @@ def train_efficientdet_detector(
     csv_writer = None
 
     logger.info(
-        "%s: старт обучения — epochs=%d, device=%s, image_size=%d, optimizer=%s(lr=%.4g)",
-        model_name, epochs, device, image_size, optimizer_name.upper(), lr,
+        "%s: старт обучения — epochs=%d, device=%s, image_size=%d, optimizer=%s(lr=%.4g, warmup_steps=%d)",
+        model_name, epochs, device, image_size, optimizer_name.upper(), lr, warmup_steps,
     )
 
+    global_step = 0
     for epoch in range(1, epochs + 1):
         model.train()
         start_time = time.time()
@@ -591,6 +607,14 @@ def train_efficientdet_detector(
         num_batches = 0
 
         for images, target in train_loader:
+            if global_step < warmup_steps:
+                # Линейный warmup: без него SGD с полным lr в первые же шаги
+                # портит предобученные веса backbone/BiFPN (см. докстринг).
+                warmup_lr = lr * (global_step + 1) / warmup_steps
+                for group in optimizer.param_groups:
+                    group["lr"] = warmup_lr
+            global_step += 1
+
             images = images.to(device)
             target = {
                 "bbox": [box.to(device) for box in target["bbox"]],
