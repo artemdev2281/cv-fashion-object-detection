@@ -520,6 +520,398 @@ def run_torchvision_training(
     )
 
 
+# ---------------------------------------------------------------------------
+# EfficientDet — свой цикл обучения (не встроен в torchvision.models.detection).
+# ---------------------------------------------------------------------------
+
+
+def train_efficientdet_detector(
+    model,
+    train_loader,
+    eval_loader,
+    config: dict,
+    *,
+    class_names: Sequence[str],
+    epochs: int = TORCHVISION_EPOCHS,
+    device: Optional[str] = None,
+    image_size: int = 512,
+    optimizer_name: str = "sgd",
+    lr: float = 0.01,
+    momentum: float = 0.9,
+    weight_decay: float = 0.0004,
+    project: str | Path | None = None,
+    logger=None,
+) -> dict:
+    """Обучить EfficientDet (``effdet.DetBenchTrain``) и вернуть метрики на test."""
+
+    import torch as _torch
+
+    from src.evaluation.metrics import evaluate_coco_detector
+    from src.models.efficientdet import EfficientDetPredictAdapter
+
+    logger = logger or get_logger()
+    training_cfg = config.get("training", {})
+    seed = training_cfg.get("seed", 42)
+    _seed_torch(seed)
+
+    if device is None:
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
+    if project is None:
+        project = PROJECT_ROOT / "results" / "logs"
+    model_name = "efficientdet"
+    out_dir = Path(project) / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.to(device)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = _build_optimizer(
+        params, optimizer_name, lr=lr, momentum=momentum, weight_decay=weight_decay
+    )
+    scheduler = _torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=max(1, int(epochs * 0.7)), gamma=0.1
+    )
+
+    use_amp = str(device).startswith("cuda")
+    scaler = _torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    csv_path = out_dir / "results.csv"
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_writer = None
+
+    logger.info(
+        "%s: старт обучения — epochs=%d, device=%s, image_size=%d, optimizer=%s(lr=%.4g)",
+        model_name, epochs, device, image_size, optimizer_name.upper(), lr,
+    )
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        start_time = time.time()
+        running_loss = 0.0
+        components: dict[str, float] = defaultdict(float)
+        num_batches = 0
+
+        for images, target in train_loader:
+            images = images.to(device)
+            target = {
+                "bbox": [box.to(device) for box in target["bbox"]],
+                "cls": [cls.to(device) for cls in target["cls"]],
+                "img_scale": target["img_scale"].to(device),
+                "img_size": target["img_size"].to(device),
+            }
+            optimizer.zero_grad()
+            with _torch.amp.autocast("cuda", enabled=use_amp):
+                loss_dict = model(images, target)
+                loss = loss_dict["loss"]
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += float(loss.item())
+            for key in ("class_loss", "box_loss"):
+                if key in loss_dict:
+                    components[key] += float(loss_dict[key].item())
+            num_batches += 1
+
+        scheduler.step()
+        avg_loss = running_loss / max(1, num_batches)
+        avg_components = {k: v / max(1, num_batches) for k, v in components.items()}
+        elapsed = time.time() - start_time
+
+        row = {
+            "epoch": epoch,
+            "train_loss": round(avg_loss, 6),
+            **{k: round(v, 6) for k, v in avg_components.items()},
+            "lr": optimizer.param_groups[0]["lr"],
+            "time_s": round(elapsed, 1),
+        }
+        if csv_writer is None:
+            csv_writer = csv.DictWriter(csv_file, fieldnames=list(row.keys()))
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
+        csv_file.flush()
+
+        logger.info(
+            "%s | эпоха %2d/%d | loss=%.4f | lr=%.2g | %.0f c",
+            model_name, epoch, epochs, avg_loss,
+            optimizer.param_groups[0]["lr"], elapsed,
+        )
+
+    csv_file.close()
+
+    weights_path = out_dir / f"{model_name}.pth"
+    _torch.save(model.model.state_dict(), weights_path)
+    logger.info("%s: веса сохранены -> %s", model_name, weights_path)
+
+    logger.info("%s: оценка на test через COCOeval...", model_name)
+    adapter = EfficientDetPredictAdapter(model, image_size=image_size).to(device)
+    metrics = evaluate_coco_detector(
+        adapter, eval_loader, device, class_names, label_offset=0, logger=logger,
+    )
+    metrics.update(
+        {"save_dir": str(out_dir), "weights": str(weights_path),
+         "epochs": epochs, "model": model_name}
+    )
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, ensure_ascii=False, indent=2)
+    logger.info("%s: метрики сохранены -> %s", model_name, out_dir / "metrics.json")
+    return metrics
+
+
+def run_efficientdet_training(
+    num_classes: int,
+    train_ann: str | Path,
+    eval_ann: str | Path,
+    data_root: str | Path,
+    config: dict,
+    *,
+    class_names: Sequence[str],
+    batch_size: int = 4,
+    epochs: int = TORCHVISION_EPOCHS,
+    image_size: int = 512,
+    num_workers: int = 2,
+    subset_size: Optional[int] = None,
+    eval_subset_size: Optional[int] = None,
+    project: str | Path | None = None,
+    logger=None,
+    **train_kwargs,
+) -> dict:
+    """Собрать loaders + модель EfficientDet и обучить с авто-откатом batch при OOM."""
+
+    from src.dataset.coco_dataset import build_loader
+    from src.models.efficientdet import build_effdet_loader, build_model
+
+    logger = logger or get_logger()
+
+    last_error: Optional[Exception] = None
+    for attempt_batch in _batch_schedule(batch_size):
+        try:
+            train_loader = build_effdet_loader(
+                train_ann, data_root, batch_size=attempt_batch, shuffle=True,
+                image_size=image_size, num_workers=num_workers, subset_size=subset_size,
+            )
+            eval_loader = build_loader(
+                eval_ann, data_root, batch_size=1, shuffle=False,
+                num_workers=num_workers, label_offset=0, subset_size=eval_subset_size,
+            )
+            model = build_model(num_classes, config)
+            logger.info("efficientdet: попытка обучения с batch=%d", attempt_batch)
+            return train_efficientdet_detector(
+                model, train_loader, eval_loader, config,
+                class_names=class_names, epochs=epochs, image_size=image_size,
+                project=project, logger=logger, **train_kwargs,
+            )
+        except RuntimeError as error:
+            last_error = error
+            if "out of memory" in str(error).lower() and attempt_batch > _MIN_BATCH:
+                logger.warning(
+                    "efficientdet: OOM при batch=%d — уменьшаю batch и пробую снова. %s",
+                    attempt_batch, error,
+                )
+                _free_cuda()
+                continue
+            raise
+
+    raise RuntimeError(
+        f"efficientdet: не удалось обучить даже при batch={_MIN_BATCH}. "
+        f"Исходная ошибка: {last_error}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DETR — свой цикл обучения (HuggingFace transformers, не torchvision).
+# ---------------------------------------------------------------------------
+
+
+def train_detr_detector(
+    model,
+    processor,
+    train_loader,
+    eval_loader,
+    config: dict,
+    *,
+    class_names: Sequence[str],
+    epochs: int = TORCHVISION_EPOCHS,
+    device: Optional[str] = None,
+    lr: float = 1e-4,
+    lr_backbone: float = 1e-5,
+    weight_decay: float = 1e-4,
+    project: str | Path | None = None,
+    logger=None,
+) -> dict:
+    """Обучить DETR (HuggingFace ``DetrForObjectDetection``) и вернуть метрики на test."""
+
+    import torch as _torch
+
+    from src.evaluation.metrics import evaluate_coco_detector
+    from src.models.detr import DetrPredictAdapter
+
+    logger = logger or get_logger()
+    training_cfg = config.get("training", {})
+    seed = training_cfg.get("seed", 42)
+    _seed_torch(seed)
+
+    if device is None:
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
+    if project is None:
+        project = PROJECT_ROOT / "results" / "logs"
+    model_name = "detr"
+    out_dir = Path(project) / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.to(device)
+    backbone_params = [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad]
+    other_params = [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]
+    optimizer = _torch.optim.AdamW(
+        [
+            {"params": other_params, "lr": lr},
+            {"params": backbone_params, "lr": lr_backbone},
+        ],
+        weight_decay=weight_decay,
+    )
+    scheduler = _torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=max(1, int(epochs * 0.7)), gamma=0.1
+    )
+
+    csv_path = out_dir / "results.csv"
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_writer = None
+
+    logger.info(
+        "%s: старт обучения — epochs=%d, device=%s, AdamW(lr=%.4g, lr_backbone=%.4g)",
+        model_name, epochs, device, lr, lr_backbone,
+    )
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        start_time = time.time()
+        running_loss = 0.0
+        components: dict[str, float] = defaultdict(float)
+        num_batches = 0
+
+        for batch in train_loader:
+            pixel_values = batch["pixel_values"].to(device)
+            pixel_mask = batch["pixel_mask"].to(device)
+            labels = [
+                {key: value.to(device) for key, value in target.items()}
+                for target in batch["labels"]
+            ]
+
+            optimizer.zero_grad()
+            outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+
+            running_loss += float(loss.item())
+            for key, value in (getattr(outputs, "loss_dict", None) or {}).items():
+                components[key] += float(value.item())
+            num_batches += 1
+
+        scheduler.step()
+        avg_loss = running_loss / max(1, num_batches)
+        avg_components = {k: v / max(1, num_batches) for k, v in components.items()}
+        elapsed = time.time() - start_time
+
+        row = {
+            "epoch": epoch,
+            "train_loss": round(avg_loss, 6),
+            **{k: round(v, 6) for k, v in avg_components.items()},
+            "lr": optimizer.param_groups[0]["lr"],
+            "time_s": round(elapsed, 1),
+        }
+        if csv_writer is None:
+            csv_writer = csv.DictWriter(csv_file, fieldnames=list(row.keys()))
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
+        csv_file.flush()
+
+        logger.info(
+            "%s | эпоха %2d/%d | loss=%.4f | lr=%.2g | %.0f c",
+            model_name, epoch, epochs, avg_loss,
+            optimizer.param_groups[0]["lr"], elapsed,
+        )
+
+    csv_file.close()
+
+    weights_path = out_dir / f"{model_name}.pth"
+    _torch.save(model.state_dict(), weights_path)
+    logger.info("%s: веса сохранены -> %s", model_name, weights_path)
+
+    logger.info("%s: оценка на test...", model_name)
+    adapter = DetrPredictAdapter(model, processor)
+    metrics = evaluate_coco_detector(
+        adapter, eval_loader, device, class_names, label_offset=0, logger=logger,
+    )
+    metrics.update(
+        {"save_dir": str(out_dir), "weights": str(weights_path),
+         "epochs": epochs, "model": model_name}
+    )
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, ensure_ascii=False, indent=2)
+    logger.info("%s: метрики сохранены -> %s", model_name, out_dir / "metrics.json")
+    return metrics
+
+
+def run_detr_training(
+    num_classes: int,
+    train_ann: str | Path,
+    eval_ann: str | Path,
+    data_root: str | Path,
+    config: dict,
+    *,
+    class_names: Sequence[str],
+    batch_size: int = 2,
+    epochs: int = TORCHVISION_EPOCHS,
+    num_workers: int = 2,
+    subset_size: Optional[int] = None,
+    eval_subset_size: Optional[int] = None,
+    project: str | Path | None = None,
+    logger=None,
+    **train_kwargs,
+) -> dict:
+    """Собрать loaders + модель DETR и обучить с авто-откатом batch при OOM."""
+    
+    from src.dataset.coco_dataset import build_loader
+    from src.models.detr import build_detr_loader, build_model, build_processor
+
+    logger = logger or get_logger()
+    processor = build_processor()
+
+    last_error: Optional[Exception] = None
+    for attempt_batch in _batch_schedule(batch_size):
+        try:
+            train_loader = build_detr_loader(
+                train_ann, data_root, processor, batch_size=attempt_batch, shuffle=True,
+                num_workers=num_workers, subset_size=subset_size,
+            )
+            eval_loader = build_loader(
+                eval_ann, data_root, batch_size=1, shuffle=False,
+                num_workers=num_workers, label_offset=0, subset_size=eval_subset_size,
+            )
+            model = build_model(num_classes, config)
+            logger.info("detr: попытка обучения с batch=%d", attempt_batch)
+            return train_detr_detector(
+                model, processor, train_loader, eval_loader, config,
+                class_names=class_names, epochs=epochs,
+                project=project, logger=logger, **train_kwargs,
+            )
+        except RuntimeError as error:
+            last_error = error
+            if "out of memory" in str(error).lower() and attempt_batch > _MIN_BATCH:
+                logger.warning(
+                    "detr: OOM при batch=%d — уменьшаю batch и пробую снова. %s",
+                    attempt_batch, error,
+                )
+                _free_cuda()
+                continue
+            raise
+
+    raise RuntimeError(
+        f"detr: не удалось обучить даже при batch={_MIN_BATCH}. "
+        f"Исходная ошибка: {last_error}"
+    )
+
+
 def _count_split_images(data_yaml: str | Path, split: str) -> int:
     """Оценить число изображений в сплите по путям из ``data.yaml``."""
     import yaml
