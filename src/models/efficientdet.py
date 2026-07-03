@@ -68,6 +68,16 @@ DEFAULT_ARCHITECTURE = "tf_efficientdet_d0"
 #: Разрешение входа, стандартное для d0.
 DEFAULT_IMAGE_SIZE = 512
 
+#: ImageNet mean/std для нормализации входа. В ОТЛИЧИЕ от torchvision-детекторов
+#: (Faster R-CNN/SSD нормализуют вход ВНУТРИ себя через GeneralizedRCNNTransform,
+#: поэтому CocoDetectionDataset отдаёт [0,1] без нормализации), модель ``effdet``
+#: нормализацию внутри НЕ делает — её штатно применяет пайплайн
+#: ``effdet.data.transforms``, который здесь заменён своим адаптером. Без этой
+#: нормализации предобученный на ImageNet backbone получает вход не в той
+#: статистике, в которой обучался (ждёт ~[-2,2], получал бы [0,1]).
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
 
 def build_model(num_classes: int, config: dict | None = None, architecture: str = DEFAULT_ARCHITECTURE):
     """Создать EfficientDet (обёртка ``DetBenchTrain``) под ``num_classes``.
@@ -127,6 +137,12 @@ def _letterbox(image: torch.Tensor, size: int) -> tuple[torch.Tensor, float]:
     ``(canvas [C, size, size], scale)``, где ``scale = size / max(H, W)`` —
     единственный коэффициент, связывающий координаты в letterbox-пространстве
     с исходным изображением (``resized = original * scale``).
+
+    Изображение нормализуется ImageNet mean/std (см. :data:`_IMAGENET_MEAN`),
+    т.к. модель ``effdet`` не нормализует вход сама. Нормализуется ТОЛЬКО
+    ресайзнутая часть, паддинг остаётся 0 (как в штатном пайплайне effdet —
+    паддинг после нормализации). Применяется одинаково в train (датасет) и
+    inference (адаптер), т.к. оба идут через ``_letterbox``.
     """
     from torchvision.transforms import functional as F
 
@@ -134,6 +150,7 @@ def _letterbox(image: torch.Tensor, size: int) -> tuple[torch.Tensor, float]:
     scale = size / max(height, width)
     new_h, new_w = max(1, round(height * scale)), max(1, round(width * scale))
     resized = F.resize(image, [new_h, new_w], antialias=True)
+    resized = (resized - _IMAGENET_MEAN.to(resized)) / _IMAGENET_STD.to(resized)
     canvas = image.new_zeros((channels, size, size))
     canvas[:, :new_h, :new_w] = resized
     return canvas, scale

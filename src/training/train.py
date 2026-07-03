@@ -540,10 +540,21 @@ def train_efficientdet_detector(
     momentum: float = 0.9,
     weight_decay: float = 0.0004,
     warmup_steps: int = 300,
+    use_amp: bool = False,
     project: str | Path | None = None,
     logger=None,
 ) -> dict:
     """Обучить EfficientDet (``effdet.DetBenchTrain``) и вернуть метрики на test.
+
+    ``use_amp=False`` по умолчанию (в отличие от torchvision-тренера): у effdet
+    голова классификации инициализируется фокал-приором (bias≈-4.6), и в fp16
+    focal-loss в зоне экстремальных логитов теряет точность — градиенты к
+    conv-весам голов выхолащиваются, обучается только bias, и модель
+    коллапсирует в input-независимый константный выход (одинаковый score на всех
+    боксах, 1-2 класса, вырожденные рамки). Это наблюдалось на реальном
+    smoke-тесте Fashionpedia. Полная точность (fp32) устраняет коллапс. Флаг
+    оставлен на случай, если понадобится сознательно включить AMP ради скорости
+    после проверки, что коллапса нет.
 
     ``lr=0.002`` (не 0.01) и ``warmup_steps=300`` — по результатам реального
     smoke-теста на Fashionpedia: с ``lr=0.01`` без warmup модель за 1-2 эпохи
@@ -586,7 +597,9 @@ def train_efficientdet_detector(
     # границе эпохи будет "пилить" lr обратно вниз, пока warmup не завершится).
     warmup_steps = min(warmup_steps, len(train_loader))
 
-    use_amp = str(device).startswith("cuda")
+    # AMP по умолчанию ВЫКЛючен для effdet — см. докстринг (fp16 + focal-loss
+    # приводит к коллапсу голов). Включается только явным use_amp=True.
+    use_amp = use_amp and str(device).startswith("cuda")
     scaler = _torch.amp.GradScaler("cuda", enabled=use_amp)
 
     csv_path = out_dir / "results.csv"
