@@ -7,14 +7,34 @@ backbone ``tf_efficientdet_d0`` + предобученные веса (COCO), г
 Конвенции ``effdet``, отличающие его от torchvision-детекторов проекта
 (Faster R-CNN/SSD) — см. также :mod:`src.training.train`:
 
-* **Индексация классов.** В отличие от torchvision, ``effdet`` НЕ резервирует
-  класс 0 под фон на входе: таргет ``cls`` при обучении — 0-based (как
-  ``category_id`` в ``classes.json``, 0..10), ``num_classes=11``.
-  ``label_offset=0`` при вызове :func:`src.evaluation.metrics.evaluate_coco_detector`.
-  **Важно:** сырые предсказания ``DetBenchPredict`` отдают класс со сдвигом
-  ``+1`` — подтверждено чтением исходника ``effdet/anchors.py::generate_detections``
-  (строка ``classes = classes[...] + 1  # back to class idx with background
-  class = 0``); в инференс-адаптере ниже это компенсируется вычитанием 1.
+* **Индексация классов — ДВА независимых +1, оба внутренние детали ``effdet``,
+  а не публичный контракт проекта.** На уровне проекта (``build_model``,
+  ``evaluate_coco_detector``) классы 0-based (0..10, ``num_classes=11``,
+  ``label_offset=0``, БЕЗ фонового сдвига, как у torchvision) — это не
+  меняется. Но ВНУТРИ ``effdet`` есть два разных технических +1, которые
+  нужно применять на границе с библиотекой:
+
+  1. **Вход в ``AnchorLabeler`` (обучение).** Подтверждено чтением
+     ``effdet/anchors.py::label_anchors``/``batch_label_anchors`` (строка
+     ``# class labels start from 1 and the background class = -1``
+     ``cls_targets = (cls_targets - 1).long()``): библиотека использует
+     raw-класс ``0`` как служебное значение "анкор не сопоставлен ни с одним
+     объектом" и лишь потом сама вычитает 1. Значит, ``gt_classes``,
+     переданные в таргет, ДОЛЖНЫ быть 1-based (1..11) — иначе анкоры,
+     сопоставленные с классом 0 проекта, стирались бы в фон, а остальные
+     классы обучались бы со сдвигом -1 (именно так и происходило до
+     исправления — см. ``EfficientDetCocoDataset.__getitem__``, ``cls`` там
+     сдвинут на +1).
+  2. **Выход ``DetBenchPredict`` (инференс).** Отдельно от п. 1, подтверждено
+     чтением ``effdet/anchors.py::generate_detections`` (строка
+     ``classes = classes[...] + 1  # back to class idx with background
+     class = 0``): сырые предсказания приходят со своим +1, который
+     компенсируется вычитанием 1 в инференс-адаптере ниже.
+
+  Оба сдвига проверены НЕ только чтением исходника, но и прогоном полного
+  цикла обучения на реальных данных Fashionpedia (не только на синтетике) —
+  без п. 1 сеть обучалась с систематическим сдвигом классов на -1 и полным
+  стиранием класса 0, что и показал реальный прогон (см. память проекта).
 * **Формат bbox таргета.** При обучении ожидает рамки в порядке ``yxyx``
   (не ``xyxy``, как в torchvision) — подтверждено по построению анкоров в
   ``effdet/anchors.py`` (``[y0, x0, y1, x1]``). Выходные детекции
@@ -126,7 +146,8 @@ class EfficientDetCocoDataset(torch.utils.data.Dataset):
     логику отбора подвыборки ``sorted(image_id)[:subset_size]``) как источник
     ``(image, target_torchvision)`` и только конвертирует изображение/таргет в
     формат, ожидаемый ``DetBenchTrain``: letterbox-ресайз изображения,
-    рамки — в ``yxyx`` в масштабе letterbox-пространства, метки — 0-based.
+    рамки — в ``yxyx`` в масштабе letterbox-пространства, метки — со сдвигом
+    +1 (см. модульный докстринг, п. 1 — обязателен для ``AnchorLabeler``).
     """
 
     def __init__(self, ann_file, data_root, image_size: int = DEFAULT_IMAGE_SIZE,
@@ -153,7 +174,12 @@ class EfficientDetCocoDataset(torch.utils.data.Dataset):
 
         effdet_target = {
             "bbox": boxes_yxyx,
-            "cls": target["labels"].to(torch.float32),
+            # +1 — ОБЯЗАТЕЛЕН для входа в AnchorLabeler (см. модульный докстринг):
+            # effdet/anchors.py использует raw-класс 0 как служебное значение
+            # "анкор не сопоставлен", а затем сам вычитает 1 (0-based класс
+            # проекта БЕЗ +1 здесь привёл бы к тому, что совпадения с классом 0
+            # стирались бы в фон, а остальные классы обучались бы со сдвигом -1).
+            "cls": (target["labels"] + 1).to(torch.float32),
             "img_scale": torch.tensor(1.0 / scale, dtype=torch.float32),
             # порядок (W, H) — подтверждено чтением effdet/anchors.py::clip_boxes_xyxy,
             # которая дублирует size в [W, H, W, H] и клипует [x1, y1, x2, y2] им же.
