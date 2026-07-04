@@ -5,10 +5,6 @@ data/processed/*
 !data/processed/.gitkeep
 
 # --- Результаты обучения ---
-results/logs/*
-!results/logs/.gitkeep
-
-# --- Веса моделей ---
 *.pt
 *.pth
 *.onnx
