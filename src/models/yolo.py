@@ -1,15 +1,11 @@
-"""Модель YOLOv8 (одноэтапный детектор семейства YOLO).
-
-Модуль инкапсулирует создание модели YOLOv8 на базе библиотеки Ultralytics.
-YOLOv8 — это не классический ``torch.nn.Module`` с ручным ``forward``, а
-высокоуровневая обёртка ``ultralytics.YOLO`` с собственным API обучения
-(``.train``), валидации (``.val``) и инференса (``.predict``). Поэтому
-:func:`build_model` возвращает именно объект ``YOLO``, готовый к передаче в
-:func:`src.training.train.train`, а не низкоуровневую сеть.
-
-Baseline стартует с предобученных весов ``yolov8n.pt`` (наименьшая модель
-семейства) — приоритет скорости обучения при отладке пайплайна.
-"""
+# Модель YOLOv8 - наша базовая модель (baseline).
+#
+# YOLOv8 берём из библиотеки Ultralytics. Это не обычная сеть на PyTorch, а
+# готовый объект YOLO со своими методами: .train (обучение), .val (проверка),
+# .predict (предсказание). Поэтому build_model возвращает именно такой объект.
+#
+# Начинаем с предобученных весов yolov8n.pt - это самая маленькая и быстрая
+# модель семейства, удобно для отладки.
 
 from __future__ import annotations
 
@@ -18,17 +14,17 @@ from typing import Optional
 
 import yaml
 
-#: Предобученные веса по умолчанию (baseline — самая лёгкая модель семейства).
+# Веса по умолчанию (самая лёгкая модель семейства).
 DEFAULT_WEIGHTS = "yolov8n.pt"
 
 
 def _read_nc(data_yaml: str | Path) -> int:
-    """Прочитать число классов ``nc`` из ``data.yaml`` Ultralytics."""
+    """Прочитать число классов nc из файла data.yaml."""
     with open(data_yaml, "r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if data.get("nc") is not None:
         return int(data["nc"])
-    # nc может отсутствовать явно — тогда берётся длина names.
+    # Если nc нет, считаем классы по длине списка имён.
     return len(data.get("names", []))
 
 
@@ -40,34 +36,23 @@ def build_model(
 ):
     """Создать модель YOLOv8, готовую к обучению.
 
-    Параметры
-    ---------
-    num_classes:
-        Число категорий одежды. Для YOLOv8 это значение **информационное**:
-        реальное число классов Ultralytics берёт из ``nc`` в ``data.yaml`` на
-        этапе ``.train``, а в конструктор ``YOLO`` оно не передаётся. Если задан
-        ``data_yaml``, функция сверяет ``num_classes`` с ``nc`` и кидает
-        понятную ошибку при несовпадении (защита от рассинхронизации данных и
-        конфигурации).
-    config:
-        Конфигурация эксперимента (``configs/default.yaml``). Из неё может быть
-        взято имя весов (``model.weights``), если не задан аргумент ``weights``.
-        Прочие гиперпараметры обучения (image_size, batch_size, optimizer …)
-        передаются не здесь, а в :func:`src.training.train.train`, поскольку у
-        Ultralytics они являются аргументами ``.train``, а не конструктора.
-    weights:
-        Имя/путь предобученных весов или ``.yaml``-архитектуры. По умолчанию
-        :data:`DEFAULT_WEIGHTS`.
-    data_yaml:
-        Необязательный путь к ``data.yaml`` для сверки ``num_classes`` с ``nc``.
+    num_classes - число классов одежды. Для YOLOv8 оно нужно только для
+    проверки: реальное число классов Ultralytics сам берёт из data.yaml при
+    обучении. Если передать data_yaml, функция сверит num_classes с числом
+    классов в файле и выдаст понятную ошибку, если они не совпадают.
 
-    Возвращает
-    ----------
-    Объект ``ultralytics.YOLO`` с загруженными весами, готовый к ``.train(...)``.
+    config - настройки; из них может браться имя весов (model.weights).
+    Остальные настройки обучения (размер картинки, batch и т.д.) передаются не
+    сюда, а в функцию train, потому что у Ultralytics это аргументы .train.
+
+    weights - имя или путь к весам, по умолчанию yolov8n.pt.
+    data_yaml - необязательный путь к data.yaml для проверки числа классов.
+
+    Возвращает объект YOLO, готовый к .train(...).
     """
     try:
         from ultralytics import YOLO
-    except ImportError as error:  # pragma: no cover - зависит от среды выполнения
+    except ImportError as error:  # библиотека может быть не установлена
         raise ImportError(
             "Для YOLOv8 требуется пакет ultralytics. "
             "Установите зависимости: pip install -r requirements.txt"

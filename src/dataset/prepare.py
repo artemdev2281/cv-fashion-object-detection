@@ -1,10 +1,10 @@
-"""Оркестрация подготовки данных Fashionpedia под обучение.
-
-Единая точка сборки пайплайна: фильтрация и remap классов -> очистка ->
-стратифицированное разбиение train/val/test -> экспорт в YOLO и COCO ->
-сохранение mapping классов -> вывод сводки. Вызывается из ``main.py
---prepare-data``. Все параметры берутся из ``configs/default.yaml``.
-"""
+# Подготовка датасета Fashionpedia к обучению.
+#
+# Здесь собран весь процесс по шагам: отобрать нужные классы -> почистить
+# рамки -> разбить на train/val/test -> сохранить в форматах YOLO и COCO ->
+# записать список классов -> напечатать сводку.
+# Запускается через: python main.py --prepare-data
+# Настройки берутся из configs/default.yaml.
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from src.utils.utils import PROJECT_ROOT, get_logger
 
 
 def _log_summary(summary: dict, class_names, logger) -> None:
-    """Вывести сводку по сплитам и распределению классов."""
+    """Напечатать таблицу: сколько картинок и объектов каждого класса в каждой части."""
     logger.info("Сводка подготовленных данных:")
     header = f"{'класс':<28}" + "".join(f"{s:>10}" for s in summary)
     logger.info(header)
@@ -37,10 +37,9 @@ def _log_summary(summary: dict, class_names, logger) -> None:
 
 
 def prepare_dataset(config: dict, logger=None) -> dict:
-    """Выполнить полный цикл подготовки данных и вернуть сводку.
+    """Пройти все шаги подготовки данных и вернуть сводку.
 
-    Параметры берутся из ``config`` (секции ``dataset``, ``training``,
-    ``paths``). Возвращает словарь-сводку по сплитам.
+    Все настройки берёт из config (разделы dataset, training, paths).
     """
     logger = logger or get_logger()
 

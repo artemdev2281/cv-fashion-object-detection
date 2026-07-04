@@ -1,24 +1,17 @@
-"""Модель DETR (детектор на основе архитектуры трансформера).
-
-Реализация через HuggingFace ``transformers``: ``DetrForObjectDetection``
-(``facebook/detr-resnet-50``, предобучена на COCO) + ``DetrImageProcessor``
-для препроцессинга/постпроцессинга. Интерфейс согласован с остальными
-детекторами проекта, но, в отличие от них, у DETR полностью своя конвенция
-данных:
-
-* **Индексация классов.** У DETR нет отдельного класса «фон» со сдвигом +1,
-  как в torchvision (см. :mod:`src.dataset.coco_dataset`): ``num_labels=11``,
-  метки 0-based (как ``category_id`` в ``classes.json``), «no-object»
-  моделируется отдельным обучаемым слотом внутри декодера DETR.
-  ``label_offset=0`` при вызове
-  :func:`src.evaluation.metrics.evaluate_coco_detector`.
-* **Формат таргета.** ``DetrImageProcessor`` сам строит таргет из COCO-style
-  аннотаций (``{"image_id", "annotations": [...]}``) и переводит рамки в
-  нормализованный ``cxcywh`` — таргет собирается процессором, не руками.
-* **Обучение.** Раздельный learning rate для backbone (меньше) и остальной
-  сети (transformer + головы) — стандартная практика fine-tuning DETR;
-  оптимизатор AdamW. Форвард возвращает уже суммарный ``outputs.loss``.
-"""
+# Модель DETR - детектор на основе трансформера.
+#
+# Берём её из библиотеки HuggingFace transformers: DetrForObjectDetection
+# (facebook/detr-resnet-50, предобучена на COCO) плюс DetrImageProcessor,
+# который готовит картинки на входе и разбирает предсказания на выходе.
+# У DETR своя логика работы с данными:
+#
+# - Номера классов. В отличие от torchvision, тут нет отдельного класса "фон"
+#   со сдвигом +1: классы идут с 0 (как в classes.json), а "тут ничего нет"
+#   модель хранит отдельно внутри себя. Поэтому при оценке label_offset=0.
+# - Разметку строит сам DetrImageProcessor из COCO-аннотаций, вручную её
+#   собирать не нужно.
+# - При обучении для backbone берём learning rate поменьше, чем для остальной
+#   сети - это обычная практика для DETR. Оптимизатор - AdamW.
 
 from __future__ import annotations
 
@@ -26,33 +19,24 @@ from typing import Optional, Sequence
 
 import torch
 
-#: Предобученный чекпоинт DETR (ResNet-50 backbone, обучен на COCO).
+# Предобученные веса DETR (backbone ResNet-50, обучена на COCO).
 DEFAULT_CHECKPOINT = "facebook/detr-resnet-50"
 
 
 def build_model(num_classes: int, config: dict | None = None, checkpoint: str = DEFAULT_CHECKPOINT):
-    """Создать DETR (``DetrForObjectDetection``) под ``num_classes``.
+    """Создать модель DETR под наше число классов.
 
-    Параметры
-    ---------
-    num_classes:
-        Число категорий одежды (11), БЕЗ фонового +1 — см. модульный докстринг.
-    config:
-        Конфигурация эксперимента (для совместимости интерфейса; гиперпараметры
-        обучения передаются в цикл обучения, а не в конструктор).
-    checkpoint:
-        Имя предобученного чекпоинта HuggingFace Hub.
+    num_classes - число классов одежды (11), без сдвига под фон (см. комментарий
+    в начале файла).
+    config - настройки (нужен просто для единого вида функций).
+    checkpoint - какие предобученные веса брать с HuggingFace.
 
-    Возвращает
-    ----------
-    ``transformers.DetrForObjectDetection`` с классификационной головой,
-    переинициализированной под ``num_classes`` (несовпадающий размер головы с
-    оригинальным COCO-чекпоинтом (91 класс) допускается через
-    ``ignore_mismatched_sizes=True``).
+    Возвращает модель DETR с новой головой под наши классы. У исходной модели
+    было 91 класс, поэтому голову пересоздаём (ignore_mismatched_sizes=True).
     """
     try:
         from transformers import DetrForObjectDetection
-    except ImportError as error:  # pragma: no cover - зависит от среды
+    except ImportError as error:  # библиотека может быть не установлена
         raise ImportError(
             "Для DETR требуется пакет transformers (pip install transformers). "
             "См. ячейку установки зависимостей в "
@@ -68,11 +52,11 @@ def build_model(num_classes: int, config: dict | None = None, checkpoint: str = 
 
 
 def build_processor(checkpoint: str = DEFAULT_CHECKPOINT, image_size: int = 800):
-    """Создать ``DetrImageProcessor`` (препроцессинг/постпроцессинг DETR).
+    """Создать DetrImageProcessor - он готовит картинки для DETR и разбирает
+    её предсказания.
 
-    ``image_size`` — сторона, к которой процессор приводит меньшую сторону
-    изображения (стандартный ресайз DETR с сохранением соотношения сторон;
-    процессор сам делает паддинг батча под общий размер через ``.pad``).
+    image_size - размер, к которому процессор приводит меньшую сторону картинки
+    (с сохранением пропорций).
     """
     from transformers import DetrImageProcessor
 
@@ -80,11 +64,10 @@ def build_processor(checkpoint: str = DEFAULT_CHECKPOINT, image_size: int = 800)
 
 
 def _boxes_xyxy_to_coco_annotations(target: dict) -> list[dict]:
-    """Собрать COCO-style annotations из таргета ``CocoDetectionDataset`` (label_offset=0).
+    """Собрать разметку в формате COCO из нашего таргета.
 
-    ``DetrImageProcessor`` ожидает на вход COCO-аннотации (``bbox`` в ``xywh``,
-    ``category_id``, ``area``), а не готовые тензоры ``boxes``/``labels`` —
-    формирует нормализованный ``cxcywh``-таргет сам.
+    DetrImageProcessor ждёт на вход именно COCO-аннотации (рамки в xywh,
+    category_id, area), а не готовые тензоры - остальное он делает сам.
     """
     boxes = target["boxes"].tolist()
     labels = target["labels"].tolist()
@@ -104,13 +87,10 @@ def _boxes_xyxy_to_coco_annotations(target: dict) -> list[dict]:
 
 
 class DetrCocoDataset(torch.utils.data.Dataset):
-    """Адаптер над :class:`src.dataset.coco_dataset.CocoDetectionDataset` под DETR.
+    """Обёртка над нашим CocoDetectionDataset, чтобы он подходил для DETR.
 
-    Переиспользует уже готовый класс проекта как источник изображений и
-    таргетов (``label_offset=0``, та же логика отбора подвыборки
-    ``sorted(image_id)[:subset_size]``), и прогоняет пару
-    (изображение, COCO-аннотации) через ``DetrImageProcessor``, который сам
-    строит нормализованный таргет DETR.
+    Берёт картинки и разметку из нашего датасета и прогоняет их через
+    DetrImageProcessor, который сам приводит их к нужному DETR виду.
     """
 
     def __init__(self, ann_file, data_root, processor, subset_size: Optional[int] = None) -> None:
@@ -144,20 +124,16 @@ class DetrCocoDataset(torch.utils.data.Dataset):
 
 
 def build_detr_collate_fn(processor):
-    """collate_fn для ``DetrCocoDataset``: ручной паддинг батча (без ``processor.pad``).
+    """Как собирать батч для DetrCocoDataset: дополняем картинки вручную.
 
-    Изображения после ``DetrImageProcessor`` имеют разный размер (ресайз с
-    сохранением аспекта под кратчайшую/длиннейшую сторону), поэтому батч нужно
-    привести к общему размеру. Паддинг сделан вручную (``F.pad`` до макс. H/W
-    в батче + ``pixel_mask`` из единиц/нулей), а НЕ через ``processor.pad`` —
-    сигнатура этого метода нестабильна между версиями ``transformers``
-    (проверено: в установленной здесь версии ``pad`` работает с ОДНИМ
-    изображением и параметром ``padded_size``, без batched
-    ``return_tensors="pt"`` из классических туториалов по DETR) — собственная
-    реализация не зависит от версии.
+    После обработки картинки в батче получаются разного размера, поэтому их надо
+    дополнить до одинакового. Делаем это сами: добавляем нули по краям до
+    максимальной ширины и высоты в батче и заодно строим pixel_mask (единицы там,
+    где настоящая картинка, нули - где добавленные поля). Свой вариант надёжнее,
+    потому что готовый processor.pad в разных версиях библиотеки работает
+    по-разному.
 
-    ``processor`` принимается для единообразия сигнатуры (не используется
-    здесь), т. к. остаётся востребованным в остальных местах модуля.
+    processor тут не используется, он в аргументах просто для единообразия.
     """
 
     def collate_fn(batch):
@@ -191,7 +167,7 @@ def build_detr_loader(
     ann_file, data_root, processor, batch_size: int, shuffle: bool,
     num_workers: int = 2, subset_size: Optional[int] = None,
 ):
-    """Собрать ``DataLoader`` над :class:`DetrCocoDataset`."""
+    """Создать DataLoader над DetrCocoDataset."""
     dataset = DetrCocoDataset(ann_file, data_root, processor, subset_size=subset_size)
     return torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=shuffle,
@@ -200,18 +176,15 @@ def build_detr_loader(
 
 
 class DetrPredictAdapter(torch.nn.Module):
-    """Тонкий инференс-адаптер DETR под контракт ``evaluate_coco_detector``.
+    """Адаптер для предсказаний DETR, чтобы их можно было оценить.
 
-    В ``eval``-режиме принимает список тензоров-изображений произвольного
-    размера в ``[0, 1]`` (как отдаёт обычный
-    :class:`src.dataset.coco_dataset.CocoDetectionDataset`, используемый БЕЗ
-    изменений для eval-loader'а) и возвращает ``List[Dict]`` с ``boxes``
-    (``xyxy`` в исходных пиксельных координатах — процессор пересчитывает их
-    сам через ``target_sizes``), ``scores`` и ``labels`` (0-based).
+    Принимает список картинок (значения от 0 до 1, обычные из нашего датасета) и
+    возвращает предсказания в том виде, который ждёт evaluate_coco_detector:
+    рамки в xyxy в исходных координатах (их пересчитывает сам процессор),
+    уверенности и номера классов (с 0).
 
-    ``threshold`` низкий (0.05) — чтобы COCOeval видел полную кривую
-    precision/recall при подсчёте mAP; операционная точка P/R внутри
-    ``evaluate_coco_detector`` отдельно считается на 0.5.
+    Порог threshold низкий (0.05) специально - чтобы при подсчёте mAP учитывались
+    все предсказания. Обычный порог 0.5 применяется отдельно уже при оценке.
     """
 
     def __init__(self, model, processor, threshold: float = 0.05) -> None:

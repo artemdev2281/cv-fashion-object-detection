@@ -1,15 +1,13 @@
-"""Экспорт подготовленного датасета в форматы YOLO и COCO.
-
-Изображения сохраняются один раз в общий каталог ``images/{split}/`` и
-переиспользуются обоими форматами: YOLO-разметка размещается рядом в
-``labels/{split}/``, COCO-аннотации ссылаются на те же файлы изображений.
-Такой подход исключает дублирование изображений и экономит диск (актуально
-для лимита 20 ГБ в Kaggle).
-
-Рамки во входном датасете — в формате Pascal VOC ``[x_min, y_min, x_max, y_max]``.
-YOLO использует нормированный формат ``x_center y_center width height``;
-COCO — абсолютный ``[x, y, width, height]``.
-"""
+# Сохранение подготовленного датасета в двух форматах: YOLO и COCO.
+#
+# Картинки сохраняем только один раз в папку images/{split}/, а оба формата на
+# них ссылаются. Так картинки не дублируются и не занимают лишнее место (важно
+# из-за лимита 20 ГБ в Kaggle). Разметка YOLO лежит рядом в labels/{split}/,
+# а разметка COCO - в отдельных json-файлах.
+#
+# Рамки на входе в формате [x_min, y_min, x_max, y_max].
+# YOLO хранит их как x_center y_center width height (числа от 0 до 1),
+# COCO - как [x, y, width, height] в пикселях.
 
 from __future__ import annotations
 
@@ -25,7 +23,7 @@ def save_class_mapping(
     orig_to_new: dict[int, int],
     path: str | Path,
 ) -> None:
-    """Сохранить соответствие «новый id -> класс» (и исходные id) в JSON."""
+    """Сохранить в JSON, какой номер какому классу соответствует."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     new_to_orig = {new: orig for orig, new in orig_to_new.items()}
@@ -43,7 +41,7 @@ def write_data_yaml(
     class_names: Sequence[str],
     splits: Sequence[str] = ("train", "val", "test"),
 ) -> Path:
-    """Сформировать ``data.yaml`` для Ultralytics YOLOv8."""
+    """Создать файл data.yaml, который нужен YOLOv8 для обучения."""
     out_dir = Path(out_dir)
     data = {
         "path": str(out_dir.resolve()),
@@ -59,7 +57,7 @@ def write_data_yaml(
 
 
 def _yolo_line(new_id: int, box: Sequence[float], width: int, height: int) -> str:
-    """Преобразовать одну VOC-рамку в строку YOLO (нормированные координаты)."""
+    """Перевести одну рамку в строку формата YOLO (координаты от 0 до 1)."""
     x_min, y_min, x_max, y_max = box
     x_center = ((x_min + x_max) / 2) / width
     y_center = ((y_min + y_max) / 2) / height
@@ -76,10 +74,10 @@ def export_dataset(
     formats: Sequence[str] = ("yolo", "coco"),
     image_quality: int = 95,
 ) -> dict:
-    """Экспортировать все сплиты в выбранные форматы и сохранить mapping классов.
+    """Сохранить все части (train/val/test) в выбранные форматы и записать классы.
 
-    Возвращает сводку по числу изображений и объектов в каждом сплите, а также
-    распределение классов по сплитам (для проверки стратификации).
+    Возвращает сводку: сколько картинок и объектов в каждой части и сколько
+    объектов каждого класса (удобно проверить, что классы поделились ровно).
     """
     out_dir = Path(out_dir)
     formats = set(formats)

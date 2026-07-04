@@ -1,37 +1,30 @@
-"""Предобработка изображений: нормализация и аугментации.
-
-Модуль задаёт преобразования, применяемые к изображениям на этапе обучения:
-приведение к целевому размеру (resize), нормализацию пикселей и аугментации.
-
-Важно про разделение ответственности между моделями:
-
-* **YOLOv8 (baseline)** выполняет resize (letterbox), нормализацию и
-  аугментации (mosaic, horizontal flip, HSV-искажения и др.) **встроенно** —
-  через аргументы обучения Ultralytics. Поэтому изображения на диск
-  сохраняются в исходном виде, а не преаугментированными; параметры
-  аугментации для YOLOv8 передаются функцией :func:`yolo_augmentation_args`.
-* **Faster R-CNN, SSD, EfficientDet, DETR** (torchvision-совместимые) получают
-  преобразования через :func:`build_transforms`.
-
-Аугментации применяются **только к train**; для val и test выполняется лишь
-детерминированный resize и нормализация — чтобы не искажать оценку качества.
-"""
+# Обработка картинок перед обучением: изменение размера, нормализация и
+# аугментации (случайные изменения картинки, чтобы модель лучше обучалась).
+#
+# Важно, что модели работают по-разному:
+# - YOLOv8 всё это делает сам внутри (через настройки Ultralytics), поэтому
+#   картинки на диске лежат обычные, а параметры аугментаций для него собирает
+#   функция yolo_augmentation_args.
+# - остальные модели (Faster R-CNN, SSD, EfficientDet, DETR) получают
+#   преобразования через build_transforms.
+#
+# Аугментации применяем только к train. Для val и test делаем только resize
+# и нормализацию, чтобы честно оценить качество.
 
 from __future__ import annotations
 
 from typing import Sequence
 
-#: Средние и стандартные отклонения ImageNet (для нормализации пикселей).
+# Стандартные числа ImageNet для нормализации пикселей.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def yolo_augmentation_args(config: dict) -> dict:
-    """Сформировать параметры аугментации YOLOv8 (Ultralytics) из конфигурации.
+    """Собрать настройки аугментаций для YOLOv8 из конфига.
 
-    Возвращает словарь аргументов обучения Ultralytics, соответствующих секции
-    ``augmentation`` конфигурации. Аугментации YOLOv8 применяются только к
-    обучающей выборке самим фреймворком.
+    Берёт раздел augmentation из конфига и превращает его в словарь настроек,
+    который понимает Ultralytics. Сами аугментации YOLOv8 делает внутри себя.
     """
     augmentation = config.get("augmentation", {})
     return {
@@ -39,33 +32,24 @@ def yolo_augmentation_args(config: dict) -> dict:
         "hsv_s": augmentation.get("color_jitter", 0.0),
         "hsv_v": augmentation.get("color_jitter", 0.0),
         "mosaic": augmentation.get("mosaic", 0.0),
-        # crop у Ultralytics задаётся через scale; включаем при random_crop.
+        # В Ultralytics обрезка (crop) включается через scale.
         "scale": 0.5 if augmentation.get("random_crop", False) else 0.0,
     }
 
 
 def build_transforms(config: dict, split: str):
-    """Построить преобразования torchvision для не-YOLO моделей.
+    """Собрать преобразования картинок для всех моделей, кроме YOLO.
 
-    Использует API ``torchvision.transforms.v2``, корректно преобразующее
-    вместе с изображением и ограничивающие рамки (при передаче цели как
-    ``tv_tensors.BoundingBoxes``). Аугментации добавляются только для ``train``.
+    Используем torchvision.transforms.v2 - он умеет менять картинку вместе с
+    рамками. Аугментации добавляем только для train.
 
-    Параметры
-    ---------
-    config:
-        Конфигурация эксперимента (секции ``training`` и ``augmentation``).
-    split:
-        Имя сплита (``train`` / ``val`` / ``test``).
-
-    Возвращает
-    ----------
-    Объект ``torchvision.transforms.v2.Compose``.
+    config - настройки, split - какая часть данных (train / val / test).
+    Возвращает готовый набор преобразований.
     """
     try:
         import torch
         from torchvision.transforms import v2
-    except ImportError as error:  # pragma: no cover - зависит от среды выполнения
+    except ImportError as error:  # библиотека может быть не установлена
         raise ImportError(
             "Для build_transforms требуется torchvision (>=0.16) с API transforms.v2. "
             "Установите зависимости из requirements.txt."
@@ -87,7 +71,7 @@ def build_transforms(config: dict, split: str):
             )
         if augmentation.get("random_crop", False):
             transforms.append(v2.RandomResizedCrop(image_size, scale=(0.8, 1.0)))
-        # Отбрасывание рамок, выродившихся после геометрических преобразований.
+        # Убираем рамки, которые испортились после случайных преобразований.
         transforms.append(v2.SanitizeBoundingBoxes())
 
     transforms.extend(

@@ -1,24 +1,16 @@
-"""COCO-датасет для torchvision detection моделей (Faster R-CNN, SSD).
-
-Общий на обе модели класс: читает COCO-аннотации проекта
-(``data/processed/coco/{split}.json``) и отдаёт пары ``(image, target)`` в
-формате, который ожидает ``torchvision.models.detection``.
-
-Ключевые тонкости
------------------
-* **Сдвиг меток на +1.** В COCO-файлах проекта ``category_id`` идут от 0
-  (shoe=0 … tights=10). В torchvision detection API класс **0 зарезервирован
-  под фон**, поэтому при подаче в модель метки сдвигаются на ``label_offset``
-  (=1): классы становятся 1..11, а ``num_classes`` модели = 12. Обратный сдвиг
-  выполняется на этапе оценки метрик (см. :mod:`src.evaluation.metrics`).
-* **Нормализация.** Отдаётся только ``to_tensor`` (пиксели в ``[0, 1]``).
-  Детекторы torchvision (Faster R-CNN, SSD) нормализуют вход **внутри себя**
-  (``GeneralizedRCNNTransform``), поэтому ручная нормализация здесь НЕ
-  выполняется — иначе была бы двойная.
-* **Путь к изображениям** строится как ``data_root / file_name`` (в COCO JSON
-  ``file_name`` — относительный путь вида ``images/train/xxxx.jpg``).
-  ``data_root`` передаётся явно (как ``DATA_ROOT`` в ноутбуке), не хардкодится.
-"""
+# Датасет в формате COCO для моделей из torchvision (Faster R-CNN, SSD).
+#
+# Читает наши COCO-аннотации (data/processed/coco/{split}.json) и выдаёт пары
+# (картинка, разметка) в том виде, который ждёт torchvision.
+#
+# Пара важных моментов:
+# - Сдвиг меток на +1. В наших файлах классы идут с 0 (0..10). А в torchvision
+#   класс 0 - это фон, поэтому при подаче в модель прибавляем label_offset (=1),
+#   и классы становятся 1..11, а всего классов у модели 12. Обратно вычитаем
+#   при подсчёте метрик (см. src/evaluation/metrics.py).
+# - Нормализацию тут НЕ делаем, отдаём только пиксели от 0 до 1. Faster R-CNN
+#   и SSD нормализуют вход сами внутри, иначе получилось бы два раза.
+# - Путь к картинке - это data_root + file_name из аннотаций.
 
 from __future__ import annotations
 
@@ -30,31 +22,23 @@ from PIL import Image
 
 
 def collate_fn(batch):
-    """collate_fn для detection: изображения и таргеты переменного размера.
+    """Как собирать батч: картинки и разметка бывают разного размера.
 
-    Стандартный ``default_collate`` не работает (разное число объектов и разные
-    размеры изображений), поэтому batch превращается в кортеж списков — как
-    принято в torchvision detection tutorials.
+    Обычный способ склейки батча тут не подходит (у картинок разное число
+    объектов и разные размеры), поэтому просто складываем их в кортеж списков.
     """
     return tuple(zip(*batch))
 
 
 class CocoDetectionDataset(torch.utils.data.Dataset):
-    """Датасет COCO-формата для torchvision detection.
+    """Датасет в формате COCO для моделей torchvision.
 
-    Параметры
-    ---------
-    ann_file:
-        Путь к COCO JSON сплита (``.../coco/train.json`` и т. п.).
-    data_root:
-        Корень подготовленных данных (``data/processed`` или его путь в Kaggle).
-        Складывается с относительным ``file_name`` из аннотаций.
-    label_offset:
-        Сдвиг меток при подаче в модель (по умолчанию ``1`` — резерв класса 0
-        под фон).
-    subset_size:
-        Если задано — берутся первые ``subset_size`` изображений (для
-        smoke-теста).
+    ann_file - путь к json-файлу части данных (например, coco/train.json).
+    data_root - папка с картинками, к ней прибавляется file_name из аннотаций.
+    label_offset - на сколько сдвигать номера классов (по умолчанию 1, потому
+    что класс 0 занят под фон).
+    subset_size - если задано, взять только первые N картинок (для быстрой
+    проверки).
     """
 
     def __init__(
@@ -90,9 +74,9 @@ class CocoDetectionDataset(torch.utils.data.Dataset):
         boxes, labels, areas, iscrowd = [], [], [], []
         for ann in anns:
             x, y, w, h = ann["bbox"]
-            if w <= 0 or h <= 0:  # защита от вырожденных рамок
+            if w <= 0 or h <= 0:  # пропускаем плохие рамки
                 continue
-            boxes.append([x, y, x + w, y + h])  # COCO xywh -> VOC xyxy
+            boxes.append([x, y, x + w, y + h])  # из формата xywh в xyxy
             labels.append(ann["category_id"] + self.label_offset)
             areas.append(ann.get("area", w * h))
             iscrowd.append(ann.get("iscrowd", 0))
@@ -116,7 +100,7 @@ def build_loader(
     label_offset: int = 1,
     subset_size: Optional[int] = None,
 ):
-    """Собрать ``DataLoader`` c нужным ``collate_fn`` над COCO-датасетом."""
+    """Создать DataLoader над нашим COCO-датасетом."""
     dataset = CocoDetectionDataset(
         ann_file, data_root, label_offset=label_offset, subset_size=subset_size
     )

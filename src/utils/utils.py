@@ -1,8 +1,5 @@
-"""Вспомогательные функции: конфигурация, логирование, визуализация.
-
-Содержит общие утилиты, используемые на всех этапах проекта и не зависящие
-от конкретной модели детектирования.
-"""
+# Разные вспомогательные функции: чтение конфига, логи, рисование рамок
+# и построение графиков для отчёта. Общие для всего проекта.
 
 from __future__ import annotations
 
@@ -11,21 +8,21 @@ from pathlib import Path
 
 import yaml
 
-#: Корневой каталог проекта.
+# Корневая папка проекта.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-#: Конфигурация по умолчанию.
+# Конфиг по умолчанию.
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict:
-    """Загрузить YAML-конфигурацию эксперимента."""
+    """Прочитать настройки из YAML-файла."""
     with open(path, "r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
 
 
 def get_logger(name: str = "fashion_detection", log_file: str | Path | None = None) -> logging.Logger:
-    """Создать логгер с выводом в консоль и (опционально) в файл."""
+    """Сделать логгер, который пишет в консоль (и при желании в файл)."""
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
@@ -50,24 +47,12 @@ def get_logger(name: str = "fashion_detection", log_file: str | Path | None = No
 
 
 def draw_boxes(image, boxes, labels=None, category_names=None, ax=None):
-    """Наложить ограничивающие рамки на изображение.
+    """Нарисовать рамки на картинке.
 
-    Параметры
-    ---------
-    image:
-        Изображение (``PIL.Image`` или массив ``numpy``).
-    boxes:
-        Последовательность рамок в формате ``[x_min, y_min, x_max, y_max]``.
-    labels:
-        Последовательность числовых меток категорий (необязательно).
-    category_names:
-        Список наименований категорий для подписи рамок (необязательно).
-    ax:
-        Объект ``matplotlib`` Axes; при ``None`` создаётся новый.
-
-    Возвращает
-    ----------
-    Объект ``matplotlib`` Axes с нанесёнными рамками.
+    image - картинка, boxes - список рамок [x_min, y_min, x_max, y_max].
+    labels - номера классов (не обязательно), category_names - их названия,
+    чтобы подписать рамки. ax - на каком графике рисовать (если None, создаём
+    новый). Возвращает график с нарисованными рамками.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
@@ -107,17 +92,16 @@ def draw_boxes(image, boxes, labels=None, category_names=None, ax=None):
 
 
 # ---------------------------------------------------------------------------
-# Графики. Строятся из логов в results/logs/, сохраняются в
-# results/plots/. Источники — CSV/JSON, полученные при обучении 5 моделей;
+# Графики для отчёта. Берём логи из results/logs/, картинки кладём в
+# results/plots/. Логи - это CSV/JSON, которые получились при обучении 5 моделей.
 # ---------------------------------------------------------------------------
 
-#: Каталоги результатов.
+# Папки с результатами.
 RESULTS_DIR = PROJECT_ROOT / "results"
 LOGS_DIR = RESULTS_DIR / "logs"
 PLOTS_DIR = RESULTS_DIR / "plots"
 
-#: Порядок и отображаемые имена 5 моделей + каталог логов каждой (после
-#: консолидации в results/logs/). Ключ совпадает с суффиксом имён файлов графиков.
+# Список наших 5 моделей: (короткое имя, красивое имя, папка с логами).
 _MODELS: list[tuple[str, str, str]] = [
     ("yolov8", "YOLOv8n", "yolov8_subset3000"),
     ("faster_rcnn", "Faster R-CNN", "faster_rcnn"),
@@ -126,7 +110,7 @@ _MODELS: list[tuple[str, str, str]] = [
     ("detr", "DETR", "detr"),
 ]
 
-#: Цвет на модель (единый по всем графикам для узнаваемости).
+# Свой цвет для каждой модели, чтобы на всех графиках они были одинаковыми.
 _MODEL_COLORS: dict[str, str] = {
     "YOLOv8n": "#1f77b4",
     "Faster R-CNN": "#2ca02c",
@@ -135,8 +119,8 @@ _MODEL_COLORS: dict[str, str] = {
     "DETR": "#d62728",
 }
 
-#: Время обучения каждой модели в минутах (Tesla T4, train=3000, 20 эпох) —
-#: для графика «точность vs скорость». Значения из логов.
+# Сколько минут обучалась каждая модель (на видеокарте Tesla T4, 3000 картинок,
+# 20 эпох). Нужно для графика "точность против скорости". Взято из логов.
 _TRAIN_MINUTES: dict[str, float] = {
     "YOLOv8n": 12.0,
     "Faster R-CNN": 138.0,
@@ -147,7 +131,7 @@ _TRAIN_MINUTES: dict[str, float] = {
 
 
 def _save_fig(fig, path: Path, logger=None) -> None:
-    """Сохранить фигуру в PNG (150 dpi) и закрыть её."""
+    """Сохранить график в PNG и закрыть его."""
     import matplotlib.pyplot as plt
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,11 +142,11 @@ def _save_fig(fig, path: Path, logger=None) -> None:
 
 
 def _load_loss_series(results_csv: Path):
-    """Вернуть ``(epochs, total_loss)`` из ``results.csv`` прогона.
+    """Достать номера эпох и лосс из файла results.csv.
 
-    У torchvision/effdet/detr суммарный лосс лежит в колонке ``train_loss``.
-    У YOLOv8 отдельных колонок несколько (``train/box_loss``, ``train/cls_loss``,
-    ``train/dfl_loss``) — суммируются в общий лосс для единообразия графика.
+    У большинства моделей лосс лежит в колонке train_loss. А у YOLOv8 он
+    разбит на несколько колонок (box_loss, cls_loss, dfl_loss), поэтому их
+    складываем, чтобы получить общий лосс.
     """
     import pandas as pd
 
@@ -171,14 +155,14 @@ def _load_loss_series(results_csv: Path):
     epochs = frame["epoch"].to_numpy() if "epoch" in frame.columns else range(1, len(frame) + 1)
     if "train_loss" in frame.columns:
         loss = frame["train_loss"].to_numpy()
-    else:  # YOLOv8: суммируем компоненты train-лосса
+    else:  # YOLOv8: складываем части лосса в один
         loss_cols = [c for c in frame.columns if c.startswith("train/") and c.endswith("loss")]
         loss = frame[loss_cols].sum(axis=1).to_numpy()
     return epochs, loss
 
 
 def plot_loss_curves(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logger=None) -> None:
-    """Построить кривые обучающего лосса по эпохам — по одной на модель (5 шт.)."""
+    """Нарисовать графики лосса по эпохам - по одному на каждую модель."""
     import matplotlib.pyplot as plt
 
     for key, name, subdir in _MODELS:
@@ -196,7 +180,7 @@ def plot_loss_curves(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, log
 
 
 def plot_per_class(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logger=None) -> None:
-    """Построить mAP@0.5 по классам — по одному bar-графику на модель (5 шт.)."""
+    """Нарисовать mAP@0.5 по каждому классу - свой столбчатый график на модель."""
     import matplotlib.pyplot as plt
     import pandas as pd
 
@@ -217,7 +201,7 @@ def plot_per_class(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logge
 
 
 def plot_comparison(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logger=None) -> None:
-    """Сгруппированная столбчатая диаграмма 5 метрик × 5 моделей."""
+    """Один общий столбчатый график: 5 метрик для всех 5 моделей рядом."""
     import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
@@ -248,7 +232,7 @@ def plot_comparison(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logg
 
 
 def plot_accuracy_vs_speed(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logger=None) -> None:
-    """Диаграмма «точность vs скорость»: mAP@0.5 против времени обучения (лог-шкала)."""
+    """График "точность против скорости": mAP@0.5 и время обучения."""
     import matplotlib.pyplot as plt
     import pandas as pd
 
@@ -273,7 +257,8 @@ def plot_accuracy_vs_speed(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DI
 
 
 def plot_hp_experiments(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logger=None) -> None:
-    """Столбчатые диаграммы подбора гиперпараметров для YOLO и SSD."""
+    """Столбчатые графики: как менялось качество при подборе гиперпараметров
+    для YOLO и SSD."""
     import matplotlib.pyplot as plt
     import pandas as pd
 
@@ -295,7 +280,7 @@ def plot_hp_experiments(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, 
 
 
 def copy_yolo_ready_figures(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logger=None) -> None:
-    """Скопировать готовые графики YOLOv8 (Ultralytics) в ``results/plots/``."""
+    """Скопировать готовые графики YOLOv8 (их рисует сам Ultralytics) в results/plots/."""
 
     import shutil
 
@@ -316,11 +301,11 @@ def copy_yolo_ready_figures(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_D
 
 
 def generate_report_figures(logs_dir: Path = LOGS_DIR, plots_dir: Path = PLOTS_DIR, logger=None) -> None:
-    """Построить все графики для из логов в ``results/logs/``.
+    """Построить сразу все графики для отчёта из логов в results/logs/.
 
-    Полный набор: 5 loss-кривых, 5 per-class диаграмм, сводное сравнение,
-    точность-vs-скорость, 2 графика HP-экспериментов + перенос готовых
-    графиков YOLOv8. Результат — PNG в ``results/plots/``.
+    Строит всё: 5 графиков лосса, 5 графиков по классам, общее сравнение,
+    точность против скорости, 2 графика по подбору гиперпараметров, плюс
+    копирует готовые графики YOLOv8. Всё сохраняется как PNG в results/plots/.
     """
     logger = logger or get_logger()
     plots_dir.mkdir(parents=True, exist_ok=True)

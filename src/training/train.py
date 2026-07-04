@@ -1,32 +1,23 @@
-"""Логика обучения моделей детектирования (реализовано для YOLOv8 baseline).
-
-Модуль предоставляет процедуру обучения YOLOv8 через API Ultralytics и
-приводит метрики к **единому контракту**, обязательному для всех пяти моделей
-проекта (YOLOv8, Faster R-CNN, SSD, EfficientDet, DETR):
-
-    {
-        "map50":    float,   # mAP@0.5
-        "map50_95": float,   # mAP@0.5:0.95 (методика COCO)
-        "precision": float,
-        "recall":   float,
-        "f1":       float,   # 2*P*R/(P+R)
-        "per_class": {  # доп. поля для анализа дисбаланса в отчёте
-            "<class>": {"map50", "map50_95", "precision", "recall", "f1"}, ...
-        },
-        "num_images": int,   # размер сплита, на котором считались метрики
-        "split": str,        # имя сплита ("test")
-        "save_dir": str,     # каталог с весами и графиками
-    }
-
-Остальные модели должны возвращать метрики в этом же формате, чтобы
-:mod:`src.evaluation.metrics` собирал их единообразно.
-
-Специфика Ultralytics: ``model`` — обёртка ``ultralytics.YOLO`` (не
-``torch.nn.Module``), а ``dataset`` здесь — **путь к ``data.yaml``**, а не HF
-``Dataset``, как в остальном пайплайне подготовки. Так сделано потому, что
-Ultralytics читает изображения и разметку сам по ``data.yaml`` и не принимает
-готовый объект датасета.
-"""
+# Обучение всех моделей: YOLOv8, Faster R-CNN, SSD, EfficientDet и DETR.
+#
+# У каждой модели свой цикл обучения, но все они возвращают метрики в одном и
+# том же виде (словарь), чтобы потом их можно было легко сравнить в отчёте:
+#
+#     {
+#         "map50":     mAP@0.5,
+#         "map50_95":  mAP@0.5:0.95,
+#         "precision": точность,
+#         "recall":    полнота,
+#         "f1":        F1 = 2*P*R/(P+R),
+#         "per_class": то же самое, но по каждому классу отдельно,
+#         "num_images": сколько картинок было в тесте,
+#         "split":      на какой части считали ("test"),
+#         "save_dir":   папка с весами и графиками,
+#     }
+#
+# Отдельно про YOLOv8: у него model - это объект Ultralytics YOLO (не обычная
+# сеть), а dataset - путь к файлу data.yaml, а не готовый датасет. Так надо,
+# потому что Ultralytics сам читает картинки и разметку по data.yaml.
 
 from __future__ import annotations
 
@@ -40,11 +31,11 @@ from typing import Callable, Optional, Sequence
 from src.dataset.transforms import yolo_augmentation_args
 from src.utils.utils import PROJECT_ROOT, get_logger
 
-#: Число эпох для baseline-прогона (проверка пайплайна end-to-end).
-#: Финальные 50 эпох из configs/default.yaml здесь НЕ используются намеренно.
+# Сколько эпох учим baseline. Полные 50 эпох из конфига тут специально не
+# берём - для проверки всего пайплайна хватает и 20.
 BASELINE_EPOCHS = 20
 
-#: Приведение имени оптимизатора из конфига к тому, что ожидает Ultralytics.
+# Ultralytics ждёт названия оптимизаторов в определённом виде - приводим к нему.
 _OPTIMIZER_ALIASES = {
     "adam": "Adam",
     "adamw": "AdamW",
@@ -57,23 +48,21 @@ _OPTIMIZER_ALIASES = {
 
 
 def _normalize_optimizer(name: str) -> str:
-    """Привести имя оптимизатора к принятому в Ultralytics написанию."""
+    """Привести название оптимизатора к виду, который понимает Ultralytics."""
     return _OPTIMIZER_ALIASES.get(str(name).lower(), name)
 
 
 def _f1(precision: float, recall: float) -> float:
-    """Гармоническое среднее точности и полноты (0 при нулевом знаменателе)."""
+    """Посчитать F1 из точности и полноты (0, если оба нули)."""
     denom = precision + recall
     return float(2 * precision * recall / denom) if denom > 0 else 0.0
 
 
 def _extract_metrics(results, split: str, num_images: int, save_dir) -> dict:
-    """Привести объект метрик Ultralytics к единому контракту проекта.
+    """Переложить метрики Ultralytics в наш общий формат.
 
-    ``results`` — объект ``DetMetrics`` из ``model.val``. Общие метрики берутся
-    из усреднённых значений (``box.map50``, ``box.map``, ``box.mp``, ``box.mr``),
-    per-class — из массивов, индексируемых ``box.ap_class_index`` (только для
-    классов, реально присутствовавших в оценке).
+    results - объект с метриками из model.val. Общие цифры берём из усреднённых
+    значений, а метрики по классам - из массивов по каждому классу отдельно.
     """
     box = results.box
     names = getattr(results, "names", {}) or {}
@@ -118,39 +107,21 @@ def train(
     logger=None,
     **train_overrides,
 ) -> dict:
-    """Обучить YOLOv8 и вернуть метрики на указанном сплите (по умолчанию test).
+    """Обучить YOLOv8 и вернуть метрики (по умолчанию на тесте).
 
-    Параметры
-    ---------
-    model:
-        Объект ``ultralytics.YOLO`` из :func:`src.models.yolo.build_model`.
-    dataset:
-        Путь к ``data.yaml`` Ultralytics (см. модульный докстринг о выборе).
-    config:
-        Конфигурация эксперимента; используются секции ``training`` и
-        ``augmentation`` (аугментации берутся через ``yolo_augmentation_args``,
-        логика не дублируется).
-    epochs:
-        Число эпох. Если ``None`` — используется :data:`BASELINE_EPOCHS` (20)
-        для baseline-прогона; финальные 50 из конфига намеренно не берутся,
-        чтобы не менять ``configs/default.yaml`` глобально.
-    batch:
-        Размер батча. Если ``None`` — берётся из ``training.batch_size``. При
-        нехватке видеопамяти (OOM) обучение автоматически повторяется с
-        ``batch=8``.
-    split:
-        Сплит для итоговой оценки. По умолчанию ``"test"`` — честная отложенная
-        оценка (val участвует в валидации во время обучения). Тот же test будет
-        использоваться остальными 4 моделями для сопоставимости.
-    project, name:
-        Каталог результатов Ultralytics: ``{project}/{name}``. По умолчанию
-        ``results/logs/yolov8_baseline`` в корне проекта.
-    train_overrides:
-        Любые дополнительные аргументы, пробрасываемые в ``model.train``.
+    model - объект YOLO из build_model.
+    dataset - путь к файлу data.yaml.
+    config - настройки (используем разделы training и augmentation).
+    epochs - число эпох; если None, берём BASELINE_EPOCHS (20).
+    batch - размер батча; если None, берём из конфига. Если не хватит
+        видеопамяти, обучение автоматически повторится с batch=8.
+    split - на какой части считать итоговые метрики. По умолчанию "test" -
+        честная оценка (val используется во время обучения). На нём же
+        считаются метрики и у остальных моделей, чтобы сравнение было честным.
+    project, name - куда сохранять результаты Ultralytics.
+    train_overrides - любые доп. аргументы для model.train.
 
-    Возвращает
-    ----------
-    Словарь метрик в едином контракте проекта (см. модульный докстринг).
+    Возвращает словарь метрик в нашем общем формате.
     """
     logger = logger or get_logger()
     training = config.get("training", {})
@@ -185,7 +156,7 @@ def train(
 
     try:
         model.train(**train_args)
-    except Exception as error:  # OOM: повтор с уменьшенным батчем
+    except Exception as error:  # не хватило памяти - пробуем меньший батч
         message = str(error).lower()
         is_oom = "out of memory" in message or ("cuda" in message and "memory" in message)
         if is_oom and train_args["batch"] > 8:
@@ -200,8 +171,8 @@ def train(
             raise
 
     logger.info("Обучение завершено. Оценка на сплите '%s'...", split)
-    # Оцениваем ЛУЧШИЕ веса (best.pt), а не последние в памяти, — это честная
-    # итоговая оценка. Если best.pt не найден, используем текущую модель.
+    # Оцениваем на лучших весах (best.pt), а не на тех, что остались в конце.
+    # Если файла best.pt нет, используем текущую модель.
     best_weights = Path(project) / name / "weights" / "best.pt"
     if best_weights.exists():
         from ultralytics import YOLO
@@ -235,32 +206,32 @@ def train(
 
 
 def _free_cuda() -> None:
-    """Освободить кеш CUDA перед повторной попыткой обучения (best-effort)."""
+    """Почистить память видеокарты перед повторной попыткой обучения."""
     try:
         import torch
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception:  # pragma: no cover - вспомогательная очистка
+    except Exception:  # если не вышло - не страшно
         pass
 
 
 # ---------------------------------------------------------------------------
-# torchvision-детекторы (Faster R-CNN, SSD) — общий цикл обучения и оценки.
+# Faster R-CNN и SSD - у них общий цикл обучения и оценки.
 # ---------------------------------------------------------------------------
 
-#: Целевое число эпох (совпадает с YOLOv8-baseline для честного сравнения).
+# Число эпох (такое же, как у YOLOv8, чтобы сравнение было честным).
 TORCHVISION_EPOCHS = 20
 
-#: Минимальный batch, ниже которого при OOM опускаться не имеет смысла.
+# Меньше этого batch при нехватке памяти опускаться уже нет смысла.
 _MIN_BATCH = 1
 
 
 def _build_optimizer(params, name: str, *, lr: float, momentum: float, weight_decay: float):
-    """Создать оптимизатор по имени (для HP-экспериментов: sgd/adam/adamw).
+    """Создать оптимизатор по названию (sgd / adam / adamw).
 
-    У Adam/AdamW рабочий lr обычно на порядок меньше, чем у SGD.
-    Подходящее значение lr должен передать вызывающий код.
+    У Adam и AdamW обычно нужен learning rate поменьше, чем у SGD - его должен
+    передать тот, кто вызывает функцию.
     """
     import torch
 
@@ -275,7 +246,7 @@ def _build_optimizer(params, name: str, *, lr: float, momentum: float, weight_de
 
 
 def _seed_torch(seed: int) -> None:
-    """Зафиксировать генераторы (torch/numpy/random) для воспроизводимости."""
+    """Зафиксировать случайность (torch, numpy, random), чтобы результат повторялся."""
     import random
 
     import numpy as np
@@ -289,7 +260,7 @@ def _seed_torch(seed: int) -> None:
 
 
 def _batch_schedule(start: int) -> list[int]:
-    """Последовательность batch для отката при OOM: start, /2, ... , 1."""
+    """Список размеров батча на случай нехватки памяти: start, /2, ... , 1."""
     schedule, value = [], int(start)
     while value >= _MIN_BATCH:
         schedule.append(value)
@@ -317,21 +288,17 @@ def train_torchvision_detector(
     label_offset: int = 1,
     logger=None,
 ) -> dict:
-    """Общий цикл обучения torchvision detection моделей (Faster R-CNN и SSD).
+    """Общий цикл обучения для Faster R-CNN и SSD (одна функция на обе модели).
 
-    Одна функция на обе модели (без дублирования). Обучает на ``train_loader``,
-    затем оценивает на ``eval_loader`` (передавать **test**-сплит для итоговой
-    честной оценки, как у YOLOv8) через :func:`evaluate_coco_detector`.
+    Учит на train_loader, потом считает метрики на eval_loader (сюда передаём
+    test, чтобы оценка была честной, как у YOLOv8).
 
-    Оптимизатор — **SGD** (lr≈0.005, momentum 0.9, weight_decay 5e-4). Для
-    архитектур Faster R-CNN / SSD это общепринятая практика, дающая устойчивую
-    сходимость; ``optimizer: adam`` из ``configs/default.yaml`` относится к
-    YOLOv8-baseline и намеренно НЕ используется здесь (в §3.5 у каждой модели
-    своя строка гиперпараметров). ``epochs`` и ``seed`` — как у baseline.
+    Оптимизатор - SGD (lr около 0.005). Для этих моделей это обычный выбор,
+    который хорошо сходится. Настройку optimizer: adam из конфига тут специально
+    не используем - она для YOLOv8. Число эпох и seed такие же, как у baseline.
 
-    Логирует loss по эпохам (консоль + ``results.csv``, аналогично YOLOv8),
-    сохраняет веса ``<model_name>.pth`` и ``metrics.json`` в
-    ``results/logs/<model_name>/``.
+    По ходу пишет loss по эпохам в консоль и в results.csv, а в конце сохраняет
+    веса (.pth) и метрики (metrics.json) в results/logs/<модель>/.
     """
     import torch
 

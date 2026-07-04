@@ -1,24 +1,9 @@
-"""Вычисление метрик качества детектирования (единый контракт проекта).
+"""Модуль для расчёта метрик качества детекции.
 
-Метрики считаются на COCO-аннотациях через ``pycocotools`` и приводятся к
-тому же контракту, что и у YOLOv8-baseline, чтобы итоговая таблица собиралась
-единообразно по всем 5 моделям:
-
-    {"map50", "map50_95", "precision", "recall", "f1", "per_class": {...}}
-
-Разделение источников метрик:
-
-* **mAP@0.5 и mAP@0.5:0.95** — из ``pycocotools.cocoeval.COCOeval`` (методика
-  COCO: усреднение AP по порогам IoU и по классам). Per-class AP берётся из
-  массива ``coco_eval.eval['precision']``.
-* **Precision и Recall** — считаются в рабочей точке (IoU=0.5, порог
-  достоверности ``score_thr``) жадным сопоставлением предсказаний с эталоном.
-  Так они интерпретируемы и близки по смыслу к P/R YOLOv8 (тоже в рабочей
-  точке), в отличие от COCO-AP, который усредняет по всей PR-кривой.
-
-Метки предсказаний приходят из модели сдвинутыми на ``label_offset`` (класс 0 —
-фон), поэтому здесь возвращаются к исходным 0-based id перед сравнением с
-COCO-аннотациями проекта.
+Используем COCO-формат аннотаций и считаем mAP через pycocotools.
+Также считаем precision и recall при конкретном пороге (IoU=0.5, score_thr=0.5),
+чтобы они были похожи на те, что выводит YOLOv8.
+Результат возвращаем в виде словаря с полями: map50, map50_95, precision, recall, f1, per_class.
 """
 
 from __future__ import annotations
@@ -28,12 +13,13 @@ from typing import Optional, Sequence
 
 
 def _xywh_to_xyxy(box) -> tuple[float, float, float, float]:
+    """Переводит рамку из формата (x, y, w, h) в (x1, y1, x2, y2)."""
     x, y, w, h = box
     return x, y, x + w, y + h
 
 
 def _iou(box_a, box_b) -> float:
-    """IoU двух рамок в формате ``[x1, y1, x2, y2]``."""
+    """Считает IoU двух прямоугольников (пересечение / объединение)."""
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
     inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
@@ -50,6 +36,7 @@ def _iou(box_a, box_b) -> float:
 
 
 def _f1(precision: float, recall: float) -> float:
+    """Считает F1-меру по precision и recall."""
     denom = precision + recall
     return float(2 * precision * recall / denom) if denom > 0 else 0.0
 
@@ -62,14 +49,13 @@ def _precision_recall(
     score_thr: float = 0.5,
     image_ids: Optional[set] = None,
 ):
-    """Precision/Recall (общие и по классам) жадным сопоставлением.
+    """Считает precision и recall (общие и по каждому классу) жадным сопоставлением.
 
-    Для каждого (изображение, класс): предсказания с ``score >= score_thr``
-    сортируются по убыванию уверенности и жадно сопоставляются с эталонными
-    рамками того же класса при ``IoU >= iou_thr`` (одна эталонная рамка — не
-    более одного сопоставления). Если задан ``image_ids``, учитываются только
-    эти изображения (для оценки на подвыборке). Возвращает
-    ``(overall, per_class)``.
+    Для каждого изображения и класса предсказания сортируются по уверенности.
+    Затем каждое предсказание пытаются сопоставить с истинной рамкой того же класса
+    при IoU >= iou_thr. Одна истинная рамка может быть использована только один раз.
+    Если задан image_ids, то считаем только по этим изображениям.
+    Возвращает (общие precision, recall) и словарь per_class.
     """
     gt_by = defaultdict(list)
     for ann in coco_gt.dataset["annotations"]:
@@ -134,22 +120,17 @@ def evaluate_coco_detector(
     iou_thr: float = 0.5,
     logger=None,
 ) -> dict:
-    """Оценить torchvision-детектор на COCO-сплите и вернуть контракт метрик.
+    """Оценивает модель детекции на COCO-датасете и возвращает метрики.
 
-    Параметры
-    ---------
-    model:
-        Обученная модель (``eval``-режим устанавливается внутри).
-    data_loader:
-        DataLoader над :class:`src.dataset.coco_dataset.CocoDetectionDataset`
-        (обычно test). Ground-truth берётся из ``data_loader.dataset.coco``.
-    device:
-        Устройство инференса.
-    class_names:
-        Имена классов в порядке исходных id 0..N-1 (для per-class отчёта).
-    label_offset:
-        Сдвиг, применённый к меткам в датасете; здесь снимается (обратно к
-        0-based id).
+    Аргументы:
+        model — обученная модель (переводится в eval-режим внутри).
+        data_loader — загрузчик данных, созданный из CocoDetectionDataset.
+        device — устройство (cpu/cuda).
+        class_names — имена классов в порядке id 0..N-1 (для per_class отчёта).
+        label_offset — сдвиг меток, который был применён в датасете (обычно 1).
+                      Здесь мы вычитаем его, чтобы вернуть исходные id.
+        score_thr, iou_thr — пороги для расчёта precision/recall.
+        logger — функция для логирования (опционально).
     """
     import torch
     from pycocotools.cocoeval import COCOeval
@@ -157,8 +138,7 @@ def evaluate_coco_detector(
     logger = logger.info if logger else (lambda *a, **k: None)
     coco_gt = data_loader.dataset.coco
     cat_ids = sorted(coco_gt.getCatIds())
-    # Оцениваем только изображения, реально прошедшие инференс (важно для
-    # подвыборки/smoke — иначе непросмотренные изображения занижают метрики).
+    # Берём только те изображения, которые реально проходят через даталоадер
     eval_image_ids = list(data_loader.dataset.ids)
 
     model.eval()
@@ -178,18 +158,20 @@ def evaluate_coco_detector(
                     results.append(
                         {
                             "image_id": image_id,
-                            "category_id": int(label) - label_offset,
+                            "category_id": int(label) - label_offset, # возвращаем исходный id
                             "bbox": [x1, y1, x2 - x1, y2 - y1],
                             "score": float(score),
                         }
                     )
 
-    if not results:  # модель ничего не предсказала (например, недообучена)
+    # Если модель ничего не предсказала, возвращаем нулевые метрики
+    if not results: 
         empty = {name: {"map50": 0.0, "map50_95": 0.0, "precision": 0.0,
                         "recall": 0.0, "f1": 0.0} for name in class_names}
         return {"map50": 0.0, "map50_95": 0.0, "precision": 0.0, "recall": 0.0,
                 "f1": 0.0, "per_class": empty, "num_detections": 0}
 
+    # Формируем COCO-формат предсказаний и запускаем оценку
     coco_dt = coco_gt.loadRes(results)
     coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
     coco_eval.params.catIds = cat_ids
@@ -201,7 +183,7 @@ def evaluate_coco_detector(
     map50_95 = float(coco_eval.stats[0])
     map50 = float(coco_eval.stats[1])
 
-    # Per-class AP из массива precision: [T(iou), R(recall), K(class), A(area), M(maxDets)].
+    # per-class AP из массива precision
     precisions = coco_eval.eval["precision"]
     per_class_ap: dict[int, tuple[float, float]] = {}
     for k, cat in enumerate(cat_ids):
@@ -213,11 +195,13 @@ def evaluate_coco_detector(
         ap50 = float(valid50.mean()) if valid50.size else 0.0
         per_class_ap[cat] = (ap50, ap)
 
+    # Считаем precision и recall в рабочей точке (IoU=0.5, score_thr)
     (precision, recall), per_class_pr = _precision_recall(
         coco_gt, results, cat_ids, iou_thr=iou_thr, score_thr=score_thr,
         image_ids=set(eval_image_ids),
     )
 
+    # Собираем per_class словарь с именами классов
     cat_to_name = {cat: coco_gt.loadCats(cat)[0]["name"] for cat in cat_ids}
     per_class: dict[str, dict] = {}
     for cat in cat_ids:
@@ -246,11 +230,9 @@ def evaluate_coco_detector(
 
 
 def evaluate(model, dataset, config: dict | None = None) -> dict:
-    """Обёртка обратной совместимости.
+    """Обёртка для обратной совместимости (не используется).
 
-    Для torchvision-детекторов используйте :func:`evaluate_coco_detector`,
-    принимающую ``DataLoader`` и устройство. Эта функция оставлена как единая
-    точка входа и делегирует, если переданы ожидаемые аргументы.
+    Для оценки используйте evaluate_coco_detector.
     """
     raise NotImplementedError(
         "Используйте evaluate_coco_detector(model, data_loader, device, class_names)."

@@ -1,19 +1,11 @@
-"""Точка входа в проект Fashion Object Detection.
-
-Поддерживаемые режимы:
-
-* ``--prepare-data`` — загрузка и предобработка датасета Fashionpedia;
-* ``--model <name>`` — обучение выбранной модели (``yolo``, ``faster_rcnn``,
-  ``ssd``, ``efficientdet``, ``detr``) на подготовленных данных.
-
-Типовой сценарий:
-
-    python main.py --prepare-data
-    python main.py --model yolo
-
-Все параметры берутся из ``configs/default.yaml`` (пути, seed, число классов,
-``dataset.subset_size`` — объём обучающей подвыборки).
-"""
+# Главный файл проекта. Отсюда запускаем всё.
+#
+# Что умеет:
+#   python main.py --prepare-data     - скачать и подготовить датасет
+#   python main.py --model yolo       - обучить модель (yolo, faster_rcnn,
+#                                       ssd, efficientdet, detr)
+#
+# Настройки лежат в configs/default.yaml.
 
 from __future__ import annotations
 
@@ -27,7 +19,7 @@ MODEL_CHOICES = ("yolo", "faster_rcnn", "ssd", "efficientdet", "detr")
 
 
 def _resolve_processed(config: dict) -> Path:
-    """Абсолютный путь к каталогу подготовленных данных из конфигурации."""
+    """Получить путь к папке с подготовленными данными."""
     processed = Path(config.get("paths", {}).get("processed_data", "data/processed"))
     if not processed.is_absolute():
         processed = PROJECT_ROOT / processed
@@ -35,7 +27,7 @@ def _resolve_processed(config: dict) -> Path:
 
 
 def _report_metrics(model_name: str, metrics: dict, logger) -> None:
-    """Единообразный вывод итоговых метрик на test."""
+    """Вывести итоговые метрики модели на тесте."""
     logger.info(
         "Готово [%s]. test mAP@0.5=%.4f, mAP@0.5:0.95=%.4f, P=%.4f, R=%.4f, F1=%.4f",
         model_name, metrics["map50"], metrics["map50_95"],
@@ -44,14 +36,11 @@ def _report_metrics(model_name: str, metrics: dict, logger) -> None:
 
 
 def _coco_inputs(config: dict) -> tuple[Path, Path, Path, list[str], int | None]:
-    """Собрать входы для torchvision/effdet/detr обучения из подготовленных данных.
+    """Собрать пути к данным для обучения faster_rcnn/ssd/efficientdet/detr.
 
-    Возвращает ``(train_ann, test_ann, data_root, class_names, subset_size)``.
-    ``data_root`` — корень ``data/processed`` (в COCO JSON ``file_name`` задан
-    относительно него). ``subset_size`` — обучающая подвыборка из
-    ``training.subset_size`` (``null`` = полный train); это отдельный параметр от
-    ``dataset.subset_size``, который ограничивает объём на этапе подготовки.
-    Итоговая оценка — всегда на полном test.
+    Возвращает пути к train.json и test.json, корень с картинками, список
+    классов и размер подвыборки для обучения (training.subset_size). Тест
+    всегда считаем на всех картинках.
     """
     processed = _resolve_processed(config)
     train_ann = processed / "coco" / "train.json"
@@ -67,7 +56,7 @@ def _coco_inputs(config: dict) -> tuple[Path, Path, Path, list[str], int | None]
 
 
 def _train_yolo(config: dict, logger) -> None:
-    """Обучить YOLOv8 на подготовленных данных (путь к ``data.yaml`` из конфига)."""
+    """Обучить YOLOv8 (ему нужен файл data.yaml)."""
     from src.models.yolo import build_model
     from src.training.train import train
 
@@ -91,11 +80,11 @@ def _train_yolo(config: dict, logger) -> None:
 
 
 def _train_torchvision(config: dict, logger, *, model_name: str, batch_size: int) -> None:
-    """Обучить Faster R-CNN или SSD общим torchvision-раннером.
+    """Обучить Faster R-CNN или SSD (у них общий код обучения).
 
-    ``num_classes = 11 + 1`` (класс 0 — фон, метки сдвинуты на +1); оптимизатор,
-    lr и прочее — дефолты раннера (SGD lr 0.005), совпадающие с использованными
-    в экспериментах.
+    num_classes = 11 классов + 1 фон = 12 (в torchvision класс 0 - это фон,
+    поэтому метки сдвинуты на +1). Оптимизатор и learning rate берутся по
+    умолчанию (SGD, lr 0.005).
     """
     from src.training.train import run_torchvision_training
 
@@ -118,7 +107,7 @@ def _train_torchvision(config: dict, logger, *, model_name: str, batch_size: int
 
 
 def _train_efficientdet(config: dict, logger) -> None:
-    """Обучить EfficientDet-D0 (пакет ``effdet``) на подготовленных данных."""
+    """Обучить EfficientDet-D0 (через библиотеку effdet)."""
     from src.training.train import run_efficientdet_training
 
     train_ann, test_ann, data_root, class_names, subset_size = _coco_inputs(config)
@@ -135,7 +124,7 @@ def _train_efficientdet(config: dict, logger) -> None:
 
 
 def _train_detr(config: dict, logger) -> None:
-    """Обучить DETR-R50 (HuggingFace ``transformers``) на подготовленных данных."""
+    """Обучить DETR-R50 (через библиотеку transformers)."""
     from src.training.train import run_detr_training
 
     train_ann, test_ann, data_root, class_names, subset_size = _coco_inputs(config)
@@ -151,7 +140,7 @@ def _train_detr(config: dict, logger) -> None:
     _report_metrics("detr", metrics, logger)
 
 
-#: Диспетчер моделей: имя -> функция запуска обучения.
+# По имени модели выбираем нужную функцию обучения.
 _TRAINERS = {
     "yolo": _train_yolo,
     "faster_rcnn": lambda c, l: _train_torchvision(c, l, model_name="faster_rcnn", batch_size=4),
